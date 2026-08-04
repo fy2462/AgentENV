@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, trace};
 
+use envd::filesystem::FilesystemClient;
 use envd::http_client::apis::{configuration::Configuration, default_api};
 use envd::http_client::models::InitPostRequest;
 use envd::process::ProcessClient;
 use envd::reqwest::Client;
+
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 static ENVD_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 
@@ -39,11 +42,22 @@ impl EnvdInstance {
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn process_client(&self) -> Result<ProcessClient> {
         trace!(grpc_address = %self.grpc_address, "connecting envd process client");
-        let result = ProcessClient::connect(&self.grpc_address)
+        let client = ProcessClient::connect(&self.grpc_address)
             .await
-            .map_err(|e| anyhow!("failed to connect process client: {e}"));
+            .context("failed to connect process client")?;
         trace!("connected to envd process client");
-        result
+        Ok(client)
+    }
+
+    /// Create a new gRPC `FilesystemClient` connected to the envd daemon.
+    #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
+    pub(crate) async fn filesystem_client(&self) -> Result<FilesystemClient> {
+        trace!(grpc_address = %self.grpc_address, "connecting envd filesystem client");
+        let client = FilesystemClient::connect(&self.grpc_address)
+            .await
+            .context("failed to connect filesystem client")?;
+        trace!("connected to envd filesystem client");
+        Ok(client)
     }
 
     #[tracing::instrument(skip(self))]
@@ -66,16 +80,29 @@ impl EnvdInstance {
                 return Err(anyhow!("timed out waiting for envd"));
             }
 
-            match default_api::health_get(&self.config).await {
-                Ok(_) => {
+            let remaining = timeout - elapsed;
+            let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, remaining);
+            match tokio::time::timeout(probe_timeout, default_api::health_get(&self.config)).await {
+                Ok(Ok(_)) => {
                     debug!(base_path = %self.config.base_path, "envd started successfully");
                     return Ok(());
                 }
+                Ok(Err(error)) => {
+                    trace!(%error, "envd health probe failed");
+                }
                 Err(_) => {
-                    let remaining = timeout - elapsed;
-                    sleep(std::cmp::min(retry_interval, remaining)).await;
+                    trace!(
+                        timeout_ms = probe_timeout.as_millis(),
+                        "envd health probe timed out"
+                    );
                 }
             }
+
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(anyhow!("timed out waiting for envd"));
+            }
+            sleep(std::cmp::min(retry_interval, remaining)).await;
         }
     }
 
@@ -97,6 +124,40 @@ impl EnvdInstance {
         };
         default_api::init_post(&self.config, Some(init_post_request)).await?;
         debug!("envd initialized");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn readiness_deadline_bounds_a_hung_health_probe() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await?;
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        });
+        let envd = EnvdInstance::new(format!("http://{address}"));
+        let deadline = Duration::from_millis(50);
+        let started = Instant::now();
+
+        let error = envd
+            .wait_for_ready(deadline, Duration::from_millis(1))
+            .await
+            .expect_err("hung health probe should reach the readiness deadline");
+
+        server.abort();
+        assert!(error.to_string().contains("timed out waiting for envd"));
+        assert!(started.elapsed() < Duration::from_millis(500));
         Ok(())
     }
 }

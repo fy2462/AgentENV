@@ -192,6 +192,9 @@ pub trait SandboxBackend: Send + 'static {
     /// [`SandboxCaptureError::Terminal`] indicates snapshot capture mutated the live
     /// runtime before failing, so callers must not keep treating the sandbox
     /// as safely runnable.
+    ///
+    /// For simplicity, [`SandboxCaptureError::Recoverable`] must guarantee the sandbox
+    /// has already been restored to a running state before the error is returned.
     async fn pause(
         &mut self,
         artifact_root: Option<&Path>,
@@ -344,6 +347,24 @@ pub trait SandboxExecutor: Send {
         self.executor()?
             .run_command_with_opts(cmd, args, opts)
             .await
+    }
+
+    /// Create a directory (and any missing parents) inside the sandbox.
+    ///
+    /// Goes through envd's filesystem service rather than exec'ing a binary,
+    /// so it works in images that ship no userland (scratch, distroless).
+    /// An already-existing directory is not an error.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use agentenv::sandbox::SandboxExecutor;
+    /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
+    /// sandbox.create_dir_all("/home/user/work").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn create_dir_all(&self, path: &str) -> Result<()> {
+        self.executor()?.create_dir_all(path).await
     }
 
     /// Start a long-running process and return a handle.

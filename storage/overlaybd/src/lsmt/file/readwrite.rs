@@ -13,7 +13,9 @@ use uuid::Uuid;
 use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::io::vfile_io::{CtxRead, CtxWrite, DirectRead, DirectWrite, FileReader, FileWriter};
+use crate::io::vfile_io::{
+    read_exact, CtxRead, CtxWrite, DirectRead, DirectWrite, FileReader, FileWriter,
+};
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
 use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
 use crate::lsmt::index::{
@@ -56,6 +58,10 @@ pub struct LSMTFile {
 }
 
 impl LSMTFile {
+    pub fn index(&self) -> Arc<RwLock<ComboIndex>> {
+        self.index.clone()
+    }
+
     fn rw_layout_from_header(header: &HeaderTrailer) -> Result<RwLayout> {
         let is_sparse_rw = header.is_sparse_rw();
         let is_hybrid_rw = header.is_hybrid_rw();
@@ -476,6 +482,10 @@ impl LSMTFile {
     }
 
     pub async fn flatten(&self, dest_file: Arc<dyn VirtualFile>) -> Result<()> {
+        self.flatten_with_args(CommitArgs::new(dest_file)).await
+    }
+
+    pub async fn flatten_with_args(&self, args: CommitArgs) -> Result<()> {
         let virtual_size = self.virtual_size.load(Ordering::Acquire);
         let query = Segment::new(0, virtual_size.div_ceil(ALIGNMENT) as u32);
         let mut mappings = Vec::new();
@@ -483,8 +493,7 @@ impl LSMTFile {
             let idx = self.index.read().await;
             idx.lookup(query, &mut mappings);
         }
-        let commit_args = CommitArgs::new(dest_file);
-        compact_to(&self.layers, &mappings, virtual_size, commit_args).await
+        compact_to(&self.layers, &mappings, virtual_size, args).await
     }
 
     pub async fn commit_with_args(&self, args: CommitArgs) -> Result<()> {
@@ -1111,16 +1120,13 @@ impl LSMTFile {
                 let layer_idx = m.tag as usize;
 
                 if let Some(layer) = self.layers.get(layer_idx) {
-                    let n = reader
-                        .read(
-                            layer.as_ref(),
-                            phys_offset,
-                            &mut buf[local_buf_pos..local_buf_pos + actual_read_len],
-                        )
-                        .await?;
-                    if n < actual_read_len {
-                        buf[local_buf_pos + n..local_buf_pos + actual_read_len].fill(0);
-                    }
+                    read_exact(
+                        reader,
+                        layer.as_ref(),
+                        phys_offset,
+                        &mut buf[local_buf_pos..local_buf_pos + actual_read_len],
+                    )
+                    .await?;
                 } else {
                     bail!("Invalid layer tag {}", layer_idx);
                 }
