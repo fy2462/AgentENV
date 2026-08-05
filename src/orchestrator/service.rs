@@ -127,6 +127,7 @@ where
         let store = InMemoryMetadataStore::new();
         let persister = FileBackedSandboxPersister::new(
             config.orchestrator.persisted_sandbox_store_path.clone(),
+            config.virtualization_mode,
         );
         Self::new(store, factory, persister).await
     }
@@ -218,7 +219,7 @@ where
         Ok(orchestrator)
     }
 
-    async fn run_lifecycle_operation<T>(
+    async fn run_cancellation_safe<T>(
         self: &Arc<Self>,
         operation: &'static str,
         sandbox_id: SandboxId,
@@ -234,14 +235,14 @@ where
                 debug!(
                     sandbox_id = %sandbox_id,
                     operation,
-                    "lifecycle operation completed after caller stopped waiting"
+                    "operation completed after caller stopped waiting"
                 );
             }
         });
 
         rx.await.map_err(|err| {
             OrchestratorError::InternalError(format!(
-                "lifecycle operation task ended before reporting result: {err}"
+                "operation task ended before reporting result: {err}"
             ))
         })?
     }
@@ -322,7 +323,7 @@ where
     ) -> Result<SandboxMetadata> {
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("create", sandbox_id, async move {
+        self.run_cancellation_safe("create", sandbox_id, async move {
             this.create_sandbox_inner(sandbox_id, request).await
         })
         .await
@@ -359,6 +360,15 @@ where
             SandboxLaunchSource::Snapshot(snapshot) => {
                 let record = snapshot.record();
                 let committed = snapshot.committed();
+                let configured_mode = ConfigManager::global_config().virtualization_mode;
+                if committed.virtualization_mode != configured_mode {
+                    self.counters.record_create_fail(1);
+                    return Err(OrchestratorError::VirtualizationModeMismatch {
+                        resource: format!("snapshot {}", record.id),
+                        resource_mode: committed.virtualization_mode,
+                        node_mode: configured_mode,
+                    });
+                }
                 let launch_image_configs = committed.image_configs.clone();
                 // Effective custom config: a launch-provided value overrides the
                 // one persisted in the source snapshot; otherwise inherit it.
@@ -377,6 +387,7 @@ where
                     id: sandbox_id,
                     snapshot_id: record.id.to_string(),
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
+                    virtualization_mode: committed.virtualization_mode,
                     runtime_versions: committed.runtime_versions.clone(),
                     resources: *snapshot.resources(),
                     context: committed.context.clone(),
@@ -428,6 +439,7 @@ where
                     id: sandbox_id,
                     snapshot_id: image_ref,
                     snapshot_alias: None,
+                    virtualization_mode: ConfigManager::global_config().virtualization_mode,
                     runtime_versions: configured_runtime_versions(),
                     resources,
                     context,
@@ -476,7 +488,7 @@ where
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("fork", source_sandbox_id, async move {
+        self.run_cancellation_safe("fork", source_sandbox_id, async move {
             this.fork_sandbox_inner(source_sandbox_id, count, new_timeout)
                 .await
         })
@@ -809,7 +821,7 @@ where
     /// races where an ongoing operation might overwrite the `Killing` state.
     pub async fn delete_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("delete", sandbox_id, async move {
+        self.run_cancellation_safe("delete", sandbox_id, async move {
             this.delete_sandbox_inner(sandbox_id).await
         })
         .await
@@ -977,7 +989,7 @@ where
     /// returns the outcome rather than duplicating the work.
     pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("pause", sandbox_id, async move {
+        self.run_cancellation_safe("pause", sandbox_id, async move {
             this.pause_sandbox_inner(sandbox_id).await
         })
         .await
@@ -1045,6 +1057,27 @@ where
             return Err(error);
         }
 
+        // Allocate persistence space while the running handle and route are
+        // still attached. Allocation does not mutate the backend, so failure
+        // only needs to restore metadata and release the temporary image refs.
+        let artifact_root = match self.persister.allocate_artifact_root(&sandbox_id).await {
+            Ok(artifact_root) => artifact_root,
+            Err(err) => {
+                warn!(error = ?err, "failed to allocate paused sandbox artifact root");
+                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                    .await;
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Pausing],
+                    )
+                    .await;
+                return Err(OrchestratorError::from(err));
+            }
+        };
+
         let (handle, removed_proxy_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
 
         let Some(handle) = handle else {
@@ -1056,8 +1089,6 @@ where
         };
 
         // Pause the sandbox and capture the paused state for resuming later.
-        let artifact_root = self.persister.allocate_artifact_root(&sandbox_id).await?;
-
         let paused_state_result = {
             let mut sandbox = handle.lock().await;
             sandbox.pause(artifact_root.as_deref()).await
@@ -1189,7 +1220,7 @@ where
         timeout: NewTimeout,
     ) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("resume", sandbox_id, async move {
+        self.run_cancellation_safe("resume", sandbox_id, async move {
             this.resume_sandbox_inner(sandbox_id, timeout).await
         })
         .await
@@ -1234,6 +1265,15 @@ where
             state => {
                 return Err(OrchestratorError::InvalidSandboxState { sandbox_id, state });
             }
+        }
+
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        if metadata.virtualization_mode != node_mode {
+            return Err(OrchestratorError::VirtualizationModeMismatch {
+                resource: format!("paused sandbox {sandbox_id}"),
+                resource_mode: metadata.virtualization_mode,
+                node_mode,
+            });
         }
 
         match self
@@ -1311,7 +1351,7 @@ where
         sandbox_id: SandboxId,
     ) -> Result<SnapshotCaptureResult> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("snapshot", sandbox_id, async move {
+        self.run_cancellation_safe("snapshot", sandbox_id, async move {
             this.capture_snapshot_inner(sandbox_id).await
         })
         .await
@@ -1425,8 +1465,25 @@ where
         })
     }
 
-    #[tracing::instrument(skip(self, network_policy), fields(sandbox_id = %sandbox_id))]
     pub async fn replace_sandbox_network_policy(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        network_policy: SandboxNetworkPolicy,
+    ) -> Result<()> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("update_network", sandbox_id, async move {
+            this.replace_sandbox_network_policy_inner(sandbox_id, network_policy)
+                .await
+        })
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "replace_sandbox_network_policy",
+        skip(self, network_policy),
+        fields(sandbox_id = %sandbox_id))
+    ]
+    async fn replace_sandbox_network_policy_inner(
         &self,
         sandbox_id: SandboxId,
         network_policy: SandboxNetworkPolicy,
@@ -1480,8 +1537,25 @@ where
     /// On hook failure the sandbox keeps its previous params and the
     /// metadata store is left untouched. Returns the new full params (`None`
     /// means empty params).
-    #[tracing::instrument(skip(self, patch), fields(sandbox_id = %sandbox_id))]
     pub async fn patch_sandbox_custom_extension_params(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        patch: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<CustomExtensionParams>> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("patch_custom_extension_params", sandbox_id, async move {
+            this.patch_sandbox_custom_extension_params_inner(sandbox_id, patch)
+                .await
+        })
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "patch_sandbox_custom_extension_params",
+        skip(self, patch),
+        fields(sandbox_id = %sandbox_id))
+    ]
+    async fn patch_sandbox_custom_extension_params_inner(
         &self,
         sandbox_id: SandboxId,
         patch: serde_json::Map<String, serde_json::Value>,

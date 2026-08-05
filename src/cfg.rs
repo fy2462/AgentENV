@@ -13,12 +13,14 @@ pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
 use serde::Deserialize;
 
+use crate::virtualization::VirtualizationMode;
+
 const ENV_CONFIG_PATH: &str = "AENV_CONFIG_PATH";
 
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
-    firecracker: ManifestDownload,
-    kernel: ManifestDownload,
+    firecracker: ManifestVirtualizationDownloads,
+    kernel: ManifestVirtualizationDownloads,
     tools: ManifestTools,
     overlaybd: ManifestDownload,
     #[serde(rename = "regclient")]
@@ -28,6 +30,21 @@ struct SetupDependencyManifest {
 #[derive(Debug, Deserialize)]
 struct ManifestDownload {
     version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestVirtualizationDownloads {
+    kvm: ManifestDownload,
+    pvm: ManifestDownload,
+}
+
+impl ManifestVirtualizationDownloads {
+    fn for_mode(&self, mode: VirtualizationMode) -> &ManifestDownload {
+        match mode {
+            VirtualizationMode::Kvm => &self.kvm,
+            VirtualizationMode::Pvm => &self.pvm,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +91,8 @@ pub struct AppConfig {
         default = "$AENV_HOME/deps"
     )]
     pub deps_path: PathBuf,
+    #[config(default = "kvm", env = "AENV_VIRTUALIZATION_MODE")]
+    pub virtualization_mode: VirtualizationMode,
     #[config(nested)]
     pub firecracker: FirecrackerConfig,
     #[config(nested)]
@@ -356,12 +375,28 @@ pub struct UblkOverlaybdTomlConfig {
     pub p2p_fetch_range_timeout_ms: u64,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySnapshotCompressionAlgorithm {
+    #[default]
+    Lz4,
+    Zstd,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
     pub overlaybd_global_config_path: PathBuf,
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD", default = true)]
     pub direct_overlaybd: bool,
+    #[config(default = false)]
+    pub compression_enabled: bool,
+    #[config(default = "lz4")]
+    pub compression_algorithm: MemorySnapshotCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// memory layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub compression_workers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -537,14 +572,25 @@ impl_config_default!(
 );
 
 impl AppConfig {
+    fn manifest_firecracker(&self) -> &ManifestDownload {
+        SetupDependencyManifest::get()
+            .firecracker
+            .for_mode(self.virtualization_mode)
+    }
+
+    fn manifest_kernel(&self) -> &ManifestDownload {
+        SetupDependencyManifest::get()
+            .kernel
+            .for_mode(self.virtualization_mode)
+    }
+
     pub fn resolved_firecracker_binary_path(&self) -> PathBuf {
         self.firecracker.binary_path.clone().unwrap_or_else(|| {
-            let manifest = SetupDependencyManifest::get();
             let version = self
                 .firecracker
                 .version
                 .as_deref()
-                .unwrap_or(&manifest.firecracker.version);
+                .unwrap_or(&self.manifest_firecracker().version);
             self.deps_path
                 .join("firecracker")
                 .join(version)
@@ -554,12 +600,11 @@ impl AppConfig {
 
     pub fn resolved_kernel_image_path(&self) -> PathBuf {
         self.kernel.image_path.clone().unwrap_or_else(|| {
-            let manifest = SetupDependencyManifest::get();
             let version = self
                 .kernel
                 .version
                 .as_deref()
-                .unwrap_or(&manifest.kernel.version);
+                .unwrap_or(&self.manifest_kernel().version);
             self.deps_path
                 .join("kernel")
                 .join(version)
@@ -606,12 +651,11 @@ impl AppConfig {
     /// Resolve the cpu-template-helper binary path derived from deps_path + version.
     /// Returns `None` if the binary does not exist on disk.
     pub fn resolved_cpu_template_helper(&self) -> Option<PathBuf> {
-        let manifest = SetupDependencyManifest::get();
         let version = self
             .firecracker
             .version
             .as_deref()
-            .unwrap_or(&manifest.firecracker.version);
+            .unwrap_or(&self.manifest_firecracker().version);
         let path = self
             .deps_path
             .join("firecracker")
@@ -1084,6 +1128,54 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn memory_snapshot_compression_config_is_valid() -> Result<()> {
+        let default = MemorySnapshotConfig::default();
+        assert!(!default.compression_enabled);
+        assert_eq!(
+            default.compression_algorithm,
+            MemorySnapshotCompressionAlgorithm::Lz4
+        );
+        assert_eq!(default.compression_workers, 1);
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in ["config/default.toml", "config/oss_default.toml"] {
+            let config = ConfigManager::new_from_path(&workspace.join(relative))?;
+            assert!(!config.config().memory_snapshot.compression_enabled);
+            assert_eq!(
+                config.config().memory_snapshot.compression_algorithm,
+                MemorySnapshotCompressionAlgorithm::Lz4,
+                "unexpected compression default in {relative}"
+            );
+            assert_eq!(
+                config.config().memory_snapshot.compression_workers,
+                1,
+                "unexpected compression_workers default in {relative}"
+            );
+        }
+
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[memory_snapshot]\ncompression_enabled = true\ncompression_algorithm = \"zstd\"\ncompression_workers = 4\n",
+        )?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(config.config().memory_snapshot.compression_enabled);
+        assert_eq!(
+            config.config().memory_snapshot.compression_algorithm,
+            MemorySnapshotCompressionAlgorithm::Zstd
+        );
+        assert_eq!(config.config().memory_snapshot.compression_workers, 4);
+
+        std::fs::write(
+            &path,
+            "[memory_snapshot]\ncompression_enabled = true\ncompression_algorithm = \"snappy\"\n",
+        )?;
+        assert!(ConfigManager::new_from_path(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn memory_snapshot_background_download_defaults() {
         let config = MemorySnapshotConfig::default();
         let download = config.background_download;
@@ -1333,6 +1425,42 @@ mod tests {
             .is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn managed_dependency_paths_select_the_active_mode_versions() {
+        let manifest = SetupDependencyManifest::get();
+        let mut config = AppConfig {
+            deps_path: PathBuf::from("/deps"),
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolved_firecracker_binary_path(),
+            PathBuf::from("/deps/firecracker")
+                .join(&manifest.firecracker.kvm.version)
+                .join("firecracker")
+        );
+        assert_eq!(
+            config.resolved_kernel_image_path(),
+            PathBuf::from("/deps/kernel")
+                .join(&manifest.kernel.kvm.version)
+                .join("vmlinux.bin")
+        );
+
+        config.virtualization_mode = VirtualizationMode::Pvm;
+        assert_eq!(
+            config.resolved_firecracker_binary_path(),
+            PathBuf::from("/deps/firecracker")
+                .join(&manifest.firecracker.pvm.version)
+                .join("firecracker")
+        );
+        assert_eq!(
+            config.resolved_kernel_image_path(),
+            PathBuf::from("/deps/kernel")
+                .join(&manifest.kernel.pvm.version)
+                .join("vmlinux.bin")
+        );
     }
 
     #[test]

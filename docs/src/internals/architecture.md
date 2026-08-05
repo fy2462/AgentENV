@@ -1,6 +1,6 @@
 # AgentENV Architecture
 
-AgentENV runs AI agents inside isolated, snapshot-capable Firecracker microVMs. Its core is a **storage subsystem** that provides layered block devices mountable into VMs and ublk-backed memory snapshot restore. The system also includes a per-node **orchestrator** managing sandbox lifecycle, and a prototype **distributed control plane** (gateway + scheduler) for multi-node routing.
+AgentENV runs AI agents inside isolated, snapshot-capable Firecracker microVMs. Its core is a **storage subsystem** that provides layered block devices mountable into VMs and ublk-backed memory snapshot restore. The system also includes a per-node **orchestrator** managing sandbox lifecycle, and a **distributed control plane** (gateway + scheduler) for multi-node routing.
 
 ## System Overview
 
@@ -135,7 +135,9 @@ Memory snapshot restore uses ublk-backed overlaybd devices rather than userfault
 
 ## Per-Node Subsystems
 
-Each node is an AgentENV server binary (`src/bin/server.rs`) on a Linux host with `/dev/kvm`.
+Each node is an AgentENV server binary (`src/bin/server.rs`) on a Linux host
+with `/dev/kvm` and one configured virtualization mode. KVM is the default;
+PVM currently requires x86_64 and the `kvm_pvm` host module.
 
 | Subsystem | Location | Responsibility |
 |-----------|----------|---------------|
@@ -212,9 +214,9 @@ See [P2P Artifact Transport](./p2p-design.md) for the detailed design.
 - `ANY /proxy`, `ANY /proxy/{path}`, routing-header fallback, and configured
   sandbox proxy hosts reverse proxy to sandbox services
 
-## Distributed Control Plane (prototype)
+## Distributed Control Plane
 
-The multi-node control plane in `services/` is a prototype. It routes client traffic across multiple AgentENV backend nodes.
+The multi-node control plane in `services/` routes client traffic across multiple AgentENV backend nodes.
 
 ```
     Client ──HTTP──> Gateway (:8080) ──gRPC──> Scheduler (:9090)
@@ -261,6 +263,7 @@ make k8s-apply
 In Kubernetes deployments, AgentENV runtime nodes run as a privileged DaemonSet
 so each host gets exactly one runtime Pod with access to `/dev/kvm`,
 iptables/network-namespace operations, and a hostPath-backed workspace cache.
+Runtime Pods on a host must all use the host's selected KVM/PVM mode.
 The deployment helpers materialize the DaemonSet ConfigMap from `config/default.toml`
 at render/apply time so AgentENV runtime config remains single-sourced.
 
@@ -320,7 +323,7 @@ src/
 ├── template/                   # user-facing template builder over snapshots
 └── cfg.rs                      # TOML config
 
-services/                       # prototype distributed control plane (Go)
+services/                       # distributed control plane (Go)
 ├── gateway/                    # HTTP reverse proxy
 ├── scheduler/                  # gRPC node selection + binding
 ├── api/proto/                  # protobuf contracts
