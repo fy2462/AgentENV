@@ -190,6 +190,7 @@ dependencies = [
  "agentenv",
  "agentenv-test-support",
  "anyhow",
+ "overlaybd",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
