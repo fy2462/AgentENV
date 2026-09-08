@@ -1,5 +1,6 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::CompleteEnv;
 
 mod auth;
 mod client;
@@ -57,9 +58,12 @@ enum Cmd {
     /// Template operations
     #[command(visible_alias = "templates")]
     Template(commands::template::Args),
+    /// Persistent volume operations
+    Volume(commands::volume::Args),
 }
 
 fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Auth => commands::auth::run(),
@@ -78,5 +82,6 @@ fn main() -> Result<()> {
         Cmd::Timeout(a) => commands::timeout::run(a),
         Cmd::Snapshot(a) => commands::snapshot::run(a),
         Cmd::Template(a) => commands::template::run(a),
+        Cmd::Volume(a) => commands::volume::run(a),
     }
 }

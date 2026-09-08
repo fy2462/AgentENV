@@ -17,6 +17,9 @@ use crate::virtualization::VirtualizationMode;
 
 const ENV_CONFIG_PATH: &str = "AENV_CONFIG_PATH";
 
+#[cfg(test)]
+const TEST_ACCESS_TOKEN_HASH_SEED: &str = "agentenv-unit-test-access-token-seed";
+
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
     firecracker: ManifestVirtualizationDownloads,
@@ -106,6 +109,10 @@ pub struct AppConfig {
     pub backend: BackendConfig,
     #[config(nested)]
     pub envd: EnvdConfig,
+    #[config(nested)]
+    pub sandbox: SandboxConfig,
+    #[config(nested)]
+    pub volume: VolumeConfig,
     #[config(nested)]
     pub orchestrator: OrchestratorConfig,
     #[config(nested)]
@@ -265,6 +272,36 @@ pub struct EnvdConfig {
     pub poll_ms: u64,
 }
 
+#[derive(Clone, Config)]
+pub struct SandboxConfig {
+    #[config(
+        env = "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
+        parse_env = parse_trimmed_string
+    )]
+    pub access_token_hash_seed: Option<String>,
+}
+
+impl std::fmt::Debug for SandboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxConfig")
+            .field(
+                "access_token_hash_seed",
+                &self.access_token_hash_seed.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct VolumeConfig {
+    /// Operator-configured maximum persistent volume size in MiB.
+    #[config(default = 262144u64)]
+    pub max_size_mb: u64,
+    /// Maximum number of persistent volumes a sandbox may mount.
+    #[config(default = 4usize)]
+    pub max_volume_count: usize,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct MachineConfig {
     #[config(default = 2u32)]
@@ -315,12 +352,43 @@ pub struct SnapshotConfig {
     pub p2p_enabled: bool,
     #[config(nested)]
     pub image_publish: SnapshotImagePublishConfig,
+    #[config(nested)]
+    pub publish_compression: SnapshotPublishCompressionConfig,
 }
 
 #[derive(Debug, Config, Clone)]
 pub struct SnapshotImagePublishConfig {
     #[config(default = false)]
     pub enabled: bool,
+}
+
+/// Publish-time compression for snapshot layers uploaded to OSS/ACR. Local
+/// layers always stay raw so local resume pays no decompression cost; when
+/// enabled, memory layers and incremental read-write layers are compressed
+/// once as they are uploaded, cutting network bytes for cross-node resume.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotPublishCompressionConfig {
+    #[config(default = true)]
+    pub enabled: bool,
+    #[config(default = "lz4")]
+    pub algorithm: OverlaybdCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub workers: usize,
+}
+
+/// Bucket addressing style for the S3-compatible snapshot backend.
+///
+/// When unset, the backend auto-detects the style: Alibaba OSS and
+/// bucket-in-endpoint hosts use virtual-host addressing, and everything else
+/// falls back to path style. Set this explicitly when a provider's required
+/// or preferred style differs from that default.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OssAddressingStyle {
+    Path,
+    Virtual,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -334,6 +402,8 @@ pub struct OssBackendConfig {
     pub access_key_secret: Option<String>,
     pub security_token: Option<String>,
     pub region: Option<String>,
+    #[serde(alias = "addressingStyle", alias = "addressing-style")]
+    pub addressing_style: Option<OssAddressingStyle>,
     pub cache_max_size_gb: Option<u64>,
 }
 
@@ -399,7 +469,7 @@ pub struct UblkOverlaybdTomlConfig {
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MemorySnapshotCompressionAlgorithm {
+pub enum OverlaybdCompressionAlgorithm {
     #[default]
     Lz4,
     Zstd,
@@ -410,17 +480,9 @@ pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
     pub overlaybd_global_config_path: PathBuf,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshots.
-    /// Default: false, preserving the mincore-based path.
-    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = false)]
+    /// Default: true; set the environment variable to false to use mincore.
+    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
-    #[config(default = false)]
-    pub compression_enabled: bool,
-    #[config(default = "lz4")]
-    pub compression_algorithm: MemorySnapshotCompressionAlgorithm,
-    /// Number of blocking threads used to compress 4KiB blocks within a
-    /// memory layer. 1 = sequential (identical output layout at any value).
-    #[config(default = 1)]
-    pub compression_workers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -583,9 +645,12 @@ impl_config_default!(
     ToolsConfig,
     SandboxProxyConfig,
     EnvdConfig,
+    SandboxConfig,
+    VolumeConfig,
     MachineConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
+    SnapshotPublishCompressionConfig,
     UblkTomlConfig,
     UblkOverlaybdTomlConfig,
     MemorySnapshotConfig,
@@ -849,6 +914,13 @@ impl AppConfig {
         }
 
         self.p2p.store_dir = resolve_path(&self.home_path, config_dir, &self.p2p.store_dir);
+
+        // Dirty-page tracking is a KVM-only default. Disable it before
+        // validation so an existing PVM configuration needs no new override.
+        if self.virtualization_mode == VirtualizationMode::Pvm {
+            self.memory_snapshot.track_dirty_pages = false;
+        }
+
         self.cluster.normalize();
         self.sandbox_proxy.normalize()?;
 
@@ -882,6 +954,28 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_volume_limits()?;
+        Ok(())
+    }
+
+    fn validate_volume_limits(&self) -> Result<()> {
+        if self.volume.max_size_mb == 0 {
+            bail!("volume.max_size_mb must be greater than 0");
+        }
+        if self.volume.max_size_mb > u64::MAX / (1024 * 1024) {
+            bail!(
+                "volume.max_size_mb must be at most {}",
+                u64::MAX / (1024 * 1024)
+            );
+        }
+        if self.volume.max_volume_count == 0
+            || self.volume.max_volume_count > crate::volume::MAX_VOLUME_MOUNTS
+        {
+            bail!(
+                "volume.max_volume_count must be between 1 and {}",
+                crate::volume::MAX_VOLUME_MOUNTS
+            );
+        }
         Ok(())
     }
 
@@ -1105,6 +1199,16 @@ impl ConfigManager {
     }
 
     fn set_global(manager: Self) -> Result<&'static Self> {
+        #[cfg(test)]
+        let manager = {
+            let mut manager = manager;
+            manager
+                .config
+                .sandbox
+                .access_token_hash_seed
+                .get_or_insert_with(|| TEST_ACCESS_TOKEN_HASH_SEED.to_string());
+            manager
+        };
         let _ = GLOBAL_CONFIG_MANAGER.set(manager);
         GLOBAL_CONFIG_MANAGER
             .get()
@@ -1286,6 +1390,26 @@ mod tests {
     }
 
     #[test]
+    fn pvm_config_disables_dirty_page_tracking() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("pvm.toml");
+        std::fs::write(&path, "virtualization_mode = \"pvm\"")?;
+
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(config.config().virtualization_mode, VirtualizationMode::Pvm);
+        assert!(!config.config().memory_snapshot.track_dirty_pages);
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_access_token_seed_is_redacted() {
+        let config = SandboxConfig {
+            access_token_hash_seed: Some("cluster-secret".to_string()),
+        };
+        assert!(!format!("{config:?}").contains("cluster-secret"));
+    }
+
+    #[test]
     fn validate_memory_snapshot_options_enforces_dirty_page_requirements() {
         let cases = [
             (VirtualizationMode::Kvm, false, None),
@@ -1400,6 +1524,29 @@ mod tests {
         config
             .validate()
             .expect("consistent disk rate limit config passes");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_volume_limits() {
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_volume_count = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = u64::MAX;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_volume_count = crate::volume::MAX_VOLUME_MOUNTS + 1;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
     }
 
     #[test]

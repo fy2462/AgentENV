@@ -187,6 +187,17 @@ init_timeout_secs = 60
 # envd readiness polling interval in milliseconds.
 poll_ms = 3
 
+[sandbox]
+# Optional secret used to derive per-sandbox envd and traffic access tokens. When unset,
+# AgentENV creates a node-local seed under $AENV_HOME/secrets. Configure the
+# same explicit value on every node when cross-node sandbox recovery is required.
+# access_token_hash_seed = "replace-with-a-secret"
+[volume]
+# Maximum persistent volume size in MiB (256 GiB by default).
+max_size_mb = 262144
+# Maximum number of persistent volumes a sandbox may mount.
+max_volume_count = 4
+
 [orchestrator]
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
 auto_evict_interval_ms = 1000
@@ -220,6 +231,18 @@ p2p_enabled = true
 # [snapshot.image_publish]
 # enabled = true
 
+# Compress memory layers and incremental read-write layers once, when they are
+# uploaded to OSS/ACR. Local layers always stay raw, so local resume pays no
+# decompression cost; enabled by default to cut network bytes for cross-node
+# resume. Disable when upload CPU matters more than transfer bytes.
+[snapshot.publish_compression]
+enabled = true
+# Supported algorithms are "lz4" and "zstd".
+algorithm = "lz4"
+# Workers compressing 4 KiB blocks. One is sequential; higher values run in
+# parallel without changing the output layout.
+workers = 1
+
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
 # snapshot filesystem.
 # [backend.posix_fs]
@@ -228,9 +251,12 @@ p2p_enabled = true
 # OSS requires an endpoint, bucket, region, and either credential_process or
 # static credentials. credential_process takes precedence over static values.
 # [backend.oss]
-# endpoint = "https://oss-cn-beijing-internal.aliyuncs.com"
-# bucket = "agentenv-snapshots"
+# endpoint = "https://<your-oss-endpoint>"
+# bucket = "your-snapshot-bucket"
 # region = "cn-beijing"
+# Bucket addressing style: "virtual" or "path". Leave unset to use
+# endpoint-based auto-detection.
+# addressing_style = "virtual" # or "path"
 # prefix = "snapshots/"
 # credential_process = "/usr/local/bin/get-oss-credentials"
 # access_key_id = "..."
@@ -282,8 +308,9 @@ maintenance_enabled = true
 [pool.block]
 # Enable the reusable OverlayBD ublk-device pool.
 enabled = true
-# Populate it after the first reusable image shape is known.
-startup_prewarm = true
+# Omit to prewarm only when the kernel supports UBLK_F_UPDATE_SIZE. Set an
+# explicit boolean to override capability-based selection.
+# startup_prewarm = true
 
 [pool.firecracker]
 # Enable pre-spawned Firecracker processes for snapshot resume.
@@ -298,18 +325,9 @@ fill_concurrency = 4
 # overlaybd_global_config_path = "$AENV_HOME/overlaybd/mem-overlaybd-global.json"
 
 # EXPERIMENTAL: use Firecracker KVM dirty-page tracking instead of mincore.
-# It is disabled for PVM. Memory snapshot packaging always uses the direct
-# OverlayBD path. Override with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES.
-track_dirty_pages = false
-
-# Compress memory snapshot layers. The algorithm is parsed but ignored when
-# compression is disabled.
-compression_enabled = false
-# Supported algorithms are "lz4" and "zstd".
-compression_algorithm = "lz4"
-# Workers compressing 4 KiB blocks. One is sequential; higher values run in
-# parallel without changing the output layout.
-compression_workers = 1
+# It is automatically disabled for PVM. Memory snapshot packaging always uses the direct
+# OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
+track_dirty_pages = true
 
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd

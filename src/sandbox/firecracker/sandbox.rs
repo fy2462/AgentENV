@@ -29,15 +29,16 @@ use crate::sandbox::custom_extension::{
 };
 
 use crate::cfg::ConfigManager;
+use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult,
+    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
     SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{
     prepare_extra_drives, DriveMount, ExtraDrive, ExtraDrivePrepareMode, ROOTFS_DRIVE_ID,
-    USER_ROOTFS_DRIVE_ID,
+    USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX,
 };
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
@@ -156,6 +157,12 @@ pub(super) fn managed_snapshot_base() -> PathBuf {
         .join("managed-snapshots")
 }
 
+const VOLUME_DRIVE_PLACEHOLDER_SIZE: u64 = 4096;
+
+fn volume_drive_slot_id(index: usize) -> String {
+    format!("{VOLUME_DRIVE_SLOT_PREFIX}{index}")
+}
+
 // ── FirecrackerSandbox ───────────────────────────────────────────────────────
 
 /// A Firecracker microVM-backed sandbox instance.
@@ -185,6 +192,10 @@ pub struct FirecrackerSandbox {
     /// waits out the fallback with no notification.
     rootfs_image_config_path: Option<PathBuf>,
     extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
+    /// Drives added to a committed snapshot at launch time are not represented
+    /// in its guest mount namespace. Mount only those drives after envd is
+    /// ready; paused-state resumes must preserve the captured mount state.
+    initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
     /// Delivers the custom extension stop hook exactly once: `stop()` calls
@@ -228,6 +239,11 @@ impl FirecrackerPausedState {
 }
 
 impl PausedSandboxState for FirecrackerPausedState {
+    fn control_plane_port(&self) -> Option<u16> {
+        let port = self.snapshot_config.common.control_plane_port;
+        (port != 0).then_some(port)
+    }
+
     fn encode(&self) -> Result<serde_json::Value> {
         serde_json::to_value(&self.snapshot_config).context("serialize Firecracker paused state")
     }
@@ -253,6 +269,48 @@ impl FirecrackerCapturedSnapshot {
     pub fn manifest(&self) -> &FirecrackerSnapshotManifest {
         &self.manifest
     }
+}
+
+fn snapshot_config_for_fork(
+    source: &FirecrackerSnapshotConfig,
+    child: &SandboxForkSpec,
+) -> Result<FirecrackerSnapshotConfig> {
+    let mut snapshot = source.clone();
+    if child.replace_drive_ids.is_empty() && child.extra_drives.is_empty() {
+        return Ok(snapshot);
+    }
+    let mut replacement_ids = std::collections::HashSet::new();
+    for (drive_id, replacement_id) in &child.replace_drive_ids {
+        anyhow::ensure!(
+            replacement_ids.insert(replacement_id.clone()),
+            "duplicate fork replacement drive {}",
+            replacement_id
+        );
+        let replacement = child
+            .extra_drives
+            .iter()
+            .find(|drive| drive.drive_id() == replacement_id)
+            .ok_or_else(|| anyhow::anyhow!("missing fork replacement drive {replacement_id}"))?;
+        let index = snapshot
+            .common
+            .extra_drives
+            .iter()
+            .position(|drive| drive.drive_id() == drive_id)
+            .ok_or_else(|| anyhow::anyhow!("fork source drive {drive_id} does not exist"))?;
+        snapshot.common.extra_drives[index] = replacement.clone();
+    }
+    for drive in &child.extra_drives {
+        anyhow::ensure!(
+            snapshot
+                .common
+                .extra_drives
+                .iter()
+                .any(|existing| existing.drive_id() == drive.drive_id()),
+            "fork cannot append drive {} to captured Firecracker state",
+            drive.drive_id()
+        );
+    }
+    Ok(snapshot)
 }
 
 #[async_trait]
@@ -282,18 +340,7 @@ impl SandboxBackend for FirecrackerSandbox {
         };
         let snapshot_config = match pause_result {
             Ok(snapshot_config) => snapshot_config,
-            Err(err) => {
-                let pause_err = SandboxCaptureError::from(err);
-                if pause_err.is_terminal() {
-                    return Err(pause_err);
-                }
-                if let Err(resume_err) = FirecrackerSandbox::resume(self).await {
-                    return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
-                        "pause failed and sandbox could not be resumed: pause error: {pause_err}; resume error: {resume_err:#}"
-                    )));
-                }
-                return Err(pause_err);
-            }
+            Err(error) => return self.recover_capture_failure("pause", error).await,
         };
         Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
     }
@@ -307,19 +354,10 @@ impl SandboxBackend for FirecrackerSandbox {
 
         let (_, manifest) = match self.pause_to_dir(&snapshot_dir).await {
             Ok(snapshot) => snapshot,
-            Err(err) => {
-                let snapshot_err = SandboxCaptureError::from(err);
-                if snapshot_err.is_terminal() {
-                    return Err(snapshot_err);
-                }
-
-                if let Err(resume_err) = FirecrackerSandbox::resume(self).await {
-                    return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
-                        "snapshot capture failed and sandbox could not be resumed: capture error: {snapshot_err}; resume error: {resume_err:#}"
-                    )));
-                }
-
-                return Err(snapshot_err);
+            Err(error) => {
+                return self
+                    .recover_capture_failure("snapshot capture", error)
+                    .await
             }
         };
         FirecrackerSandbox::resume(self)
@@ -331,36 +369,70 @@ impl SandboxBackend for FirecrackerSandbox {
         ))
     }
 
+    async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
+        if !self.has_writable_persistent_volumes() {
+            return Ok(());
+        }
+
+        let envd = self
+            .envd_instance
+            .clone()
+            .context("cannot flush writable volumes because envd is not running")
+            .map_err(SandboxCaptureError::recoverable)?;
+        Self::sync_writable_volume_filesystems(envd)
+            .await
+            .map_err(SandboxCaptureError::recoverable)?;
+
+        if let Err(error) = self.fc_instance.pause().await {
+            return self.recover_capture_failure("volume snapshot", error).await;
+        }
+
+        if let Err(error) = self.snapshot_persistent_volume_drives().await {
+            return self.recover_capture_failure("volume snapshot", error).await;
+        }
+
+        FirecrackerSandbox::resume(self)
+            .await
+            .map_err(SandboxCaptureError::terminal)
+    }
+
     async fn fork(
         &mut self,
-        child_ids: &[SandboxId],
+        spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>> {
         let snapshot_config = match FirecrackerSandbox::pause(self).await {
             Ok(snapshot_config) => snapshot_config,
-            Err(err) => {
-                let checkpoint_err = SandboxCaptureError::from(err);
-                if checkpoint_err.is_terminal() {
-                    return Err(checkpoint_err);
-                }
-                if let Err(resume_err) = FirecrackerSandbox::resume(self).await {
-                    return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
-                        "fork checkpoint failed and sandbox could not be resumed: checkpoint error: {checkpoint_err}; resume error: {resume_err:#}"
-                    )));
-                }
-                return Err(checkpoint_err);
-            }
+            Err(error) => return self.recover_capture_failure("fork snapshot", error).await,
         };
 
         FirecrackerSandbox::resume(self)
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
-        let children = child_ids
+        let children = spec
             .iter()
-            .map(|&child_id| {
-                Self::from_snapshot_config_with_id(&snapshot_config, child_id)
-                    .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
-                    .context("build forked sandbox")
+            .map(|child| {
+                let physical_count = snapshot_config.common.physical_extra_drive_count;
+                if child.replace_drive_ids.iter().any(|(drive_id, _)| {
+                    snapshot_config
+                        .common
+                        .extra_drives
+                        .iter()
+                        .take(physical_count)
+                        .any(|drive| drive.drive_id() == drive_id)
+                }) {
+                    return Err(anyhow::anyhow!(
+                        "fork replacement drives must refer to launch-time volume drives"
+                    ));
+                }
+                let child_snapshot_config = snapshot_config_for_fork(&snapshot_config, child)?;
+                Self::from_snapshot_config_with_override(
+                    child_snapshot_config,
+                    child.sandbox_id,
+                    child.envd_access_token.clone(),
+                )
+                .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
+                .context("build forked sandbox")
             })
             .collect::<Vec<_>>();
 
@@ -414,7 +486,7 @@ impl SandboxBackend for FirecrackerSandbox {
     }
 
     async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {
-        if let Some(slot) = self.network_slot.as_ref() {
+        if let Some(slot) = self.network_slot.as_mut() {
             slot.set_egress_policy(policy.as_ref())
                 .context("configure sandbox network policy")?;
             self.current_network_policy = policy;
@@ -436,18 +508,35 @@ impl SandboxBackend for FirecrackerSandbox {
 
 #[async_trait(?Send)]
 impl SandboxExecutor for FirecrackerSandbox {
-    fn executor(&self) -> Result<Executor<'_>> {
+    fn executor(&self) -> Result<Executor> {
         let envd = self
             .envd_instance
             .as_ref()
             .context("Sandbox is not running")?;
-        Ok(Executor::new(envd))
+        Ok(Executor::new(envd.clone()))
     }
 }
 
 // ── FirecrackerSandbox public API ────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    async fn recover_capture_failure<T>(
+        &mut self,
+        operation: &'static str,
+        error: anyhow::Error,
+    ) -> SandboxCaptureResult<T> {
+        let capture_error = SandboxCaptureError::from(error);
+        if capture_error.is_terminal() {
+            return Err(capture_error);
+        }
+        if let Err(resume_error) = FirecrackerSandbox::resume(self).await {
+            return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                "{operation} failed and sandbox could not be resumed: {capture_error}; resume error: {resume_error:#}"
+            )));
+        }
+        Err(capture_error)
+    }
+
     fn snapshot_rootfs_virtual_size(&self) -> Result<u64> {
         self.current_rootfs_virtual_size.context(
             "rootfs virtual size cache missing; sandbox must record the user image block-device size before snapshot; ensure start() was called before pause() or snapshot",
@@ -462,7 +551,24 @@ impl FirecrackerSandbox {
         Self::new_with_id(config, SandboxId::new())
     }
 
-    pub(crate) fn new_with_id(config: FirecrackerSandboxConfig, id: SandboxId) -> Result<Self> {
+    pub(crate) fn new_with_id(mut config: FirecrackerSandboxConfig, id: SandboxId) -> Result<Self> {
+        let (mut physical_drives, volume_drives): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut config.common.extra_drives)
+                .into_iter()
+                .partition(|drive| !drive.is_volume());
+        config.common.physical_extra_drive_count = physical_drives.len();
+        config.common.volume_drive_slots = ConfigManager::global_config()
+            .volume
+            .max_volume_count
+            .min(MAX_EXTRA_DRIVES.saturating_sub(config.common.physical_extra_drive_count));
+        anyhow::ensure!(
+            volume_drives.len() <= config.common.volume_drive_slots,
+            "fresh sandbox has {} volumes but only {} reserved volume slots",
+            volume_drives.len(),
+            config.common.volume_drive_slots
+        );
+        physical_drives.extend(volume_drives);
+        config.common.extra_drives = physical_drives;
         debug!(
             firecracker_binary = %config.common.firecracker_binary.display(),
             kernel_image = %config.kernel_image.display(),
@@ -478,21 +584,45 @@ impl FirecrackerSandbox {
     /// Call [`FirecrackerSandbox::start`] or [`FirecrackerSandbox::start_nowait`] to boot it.
     #[tracing::instrument(skip(snapshot))]
     pub fn from_snapshot_config(snapshot: &FirecrackerSnapshotConfig) -> Result<Self> {
-        Self::from_snapshot_config_with_id(snapshot, SandboxId::new())
+        Self::from_snapshot_config_with_override(
+            snapshot.clone(),
+            SandboxId::new(),
+            snapshot.common.envd_access_token.clone(),
+        )
     }
 
-    pub(crate) fn from_snapshot_config_with_id(
-        snapshot: &FirecrackerSnapshotConfig,
+    pub(crate) fn from_snapshot_config_with_override(
+        mut snapshot: FirecrackerSnapshotConfig,
         id: SandboxId,
+        envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Self> {
-        let mut snapshot = snapshot.clone();
-
-        // Ensure the snapshot's MMDS metadata has the correct sandbox ID.
-        snapshot
-            .common
-            .mmds_metadata
-            .get_or_insert_with(|| MmdsMetadata::new(id, "unknown"))
-            .sandbox_id = id.to_string();
+        if snapshot.common.volume_drive_slots == 0 {
+            // Legacy snapshots contain every configured extra drive directly.
+            snapshot.common.physical_extra_drive_count = snapshot.common.extra_drives.len();
+        }
+        anyhow::ensure!(
+            snapshot.common.physical_extra_drive_count <= snapshot.common.extra_drives.len(),
+            "snapshot records {} physical extra drives but only {} logical drives",
+            snapshot.common.physical_extra_drive_count,
+            snapshot.common.extra_drives.len()
+        );
+        anyhow::ensure!(
+            snapshot.common.extra_drives.len() - snapshot.common.physical_extra_drive_count
+                <= snapshot.common.volume_drive_slots,
+            "snapshot has {} launch-time volume drives but only {} reserved drive slots",
+            snapshot.common.extra_drives.len() - snapshot.common.physical_extra_drive_count,
+            snapshot.common.volume_drive_slots
+        );
+        // Runtime identity and auth override their values in the source snapshot.
+        snapshot.common.envd_access_token = envd_access_token;
+        let FirecrackerCommonConfig {
+            mmds_metadata,
+            envd_access_token,
+            ..
+        } = &mut snapshot.common;
+        let metadata = mmds_metadata.get_or_insert_with(|| MmdsMetadata::new(id, "unknown"));
+        metadata.sandbox_id = id.to_string();
+        metadata.set_access_token(envd_access_token.as_ref());
 
         debug!(
             vm_state_path = %snapshot.vm_state_path.display(),
@@ -513,11 +643,32 @@ impl FirecrackerSandbox {
         launch_config: &SandboxLaunchConfig,
     ) -> Result<Self> {
         let snapshot_config = Self::snapshot_config_for_launch(snapshot, launch_config)?;
-
-        Self::build(
+        let initial_guest_drive_mounts =
+            Self::initial_guest_drive_mounts_for_snapshot_launch(&snapshot_config, launch_config);
+        let mut sandbox = Self::build(
             launch_config.sandbox_id,
             LaunchMode::Resume(snapshot_config),
-        )
+        )?;
+        sandbox.initial_guest_drive_mounts = initial_guest_drive_mounts;
+        Ok(sandbox)
+    }
+
+    fn initial_guest_drive_mounts_for_snapshot_launch(
+        snapshot_config: &FirecrackerSnapshotConfig,
+        launch_config: &SandboxLaunchConfig,
+    ) -> Vec<(usize, ExtraDrive)> {
+        if launch_config.extra_drives_in_snapshot {
+            return Vec::new();
+        }
+
+        let first_slot_index = snapshot_config.common.physical_extra_drive_count;
+        launch_config
+            .extra_drives
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, drive)| (first_slot_index + index, drive))
+            .collect()
     }
 
     fn snapshot_config_for_launch(
@@ -525,10 +676,22 @@ impl FirecrackerSandbox {
         launch_config: &SandboxLaunchConfig,
     ) -> Result<FirecrackerSnapshotConfig> {
         let mut snapshot_config = FirecrackerSnapshotConfig::from_runnable_snapshot(snapshot)?;
+        anyhow::ensure!(
+            launch_config.extra_drives.len() <= snapshot_config.common.volume_drive_slots,
+            "snapshot supports at most {} launch-time volume drives, requested {}",
+            snapshot_config.common.volume_drive_slots,
+            launch_config.extra_drives.len()
+        );
+        snapshot_config
+            .common
+            .extra_drives
+            .extend(launch_config.extra_drives.clone());
         snapshot_config.common.mmds_metadata = Some(
             MmdsMetadata::new(launch_config.sandbox_id, launch_config.snapshot_id.clone())
+                .with_access_token(launch_config.envd_access_token.as_ref())
                 .with_extra(launch_config.extra_mmds.clone()),
         );
+        snapshot_config.common.envd_access_token = launch_config.envd_access_token.clone();
         snapshot_config.common.network_policy = launch_config.network.clone();
 
         // Launch-provided custom config overrides the value persisted in the
@@ -606,7 +769,144 @@ impl FirecrackerSandbox {
                 self.launch.common().default_workdir.clone(),
                 self.launch.common().default_user.clone(),
             )
-            .await
+            .await?;
+
+        // The snapshot already carries mount state for its existing drives.
+        // Only drives newly supplied for this launch need a guest-side mount.
+        if !self.initial_guest_drive_mounts.is_empty() {
+            let envd = self
+                .envd_instance
+                .clone()
+                .context("Sandbox is not running")?;
+            Self::mount_initial_guest_drives(envd, self.initial_guest_drive_mounts.clone()).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn mount_initial_guest_drives(
+        envd: EnvdInstance,
+        drives: Vec<(usize, ExtraDrive)>,
+    ) -> Result<()> {
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current()
+                .block_on(Self::mount_initial_guest_drives_inner(envd, drives))
+        })
+        .await
+        .context("initial volume mount task failed")??;
+        Ok(())
+    }
+
+    async fn mount_initial_guest_drives_inner(
+        envd: EnvdInstance,
+        drives: Vec<(usize, ExtraDrive)>,
+    ) -> Result<()> {
+        for (index, drive) in &drives {
+            let device = format!("/dev/vd{}", char::from(b'c' + *index as u8));
+            let target = drive.mount_path().to_string_lossy().into_owned();
+            Self::create_guest_directory(&envd, &target).await?;
+            let mount_options = if drive.read_only() {
+                // Volume snapshots are crash-consistent: even after sync, ext4
+                // retains the needs-recovery flag until a clean unmount. A
+                // read-only OverlayBD device cannot replay that journal, so
+                // suppress replay while also enforcing a read-only guest mount.
+                &["-o", "ro,noload"][..]
+            } else {
+                &[][..]
+            };
+
+            if let Some(sub_path) = drive.sub_path() {
+                let stage = format!("/run/agentenv-drive-{}", drive.drive_id());
+                Self::create_guest_directory(&envd, &stage).await?;
+                Self::mount_guest_path_with_options(envd.clone(), mount_options, &device, &stage)
+                    .await?;
+                let source = format!("{stage}/{}", sub_path.display());
+                Self::mount_guest_path_with_options(envd.clone(), &["--bind"], &source, &target)
+                    .await?;
+                let _ = Self::run_guest_command(
+                    envd.clone(),
+                    "/agentenv/bin/busybox".to_owned(),
+                    vec!["umount".to_owned(), "-l".to_owned(), stage.clone()],
+                )
+                .await;
+            } else {
+                Self::mount_guest_path_with_options(envd.clone(), mount_options, &device, &target)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn create_guest_directory(envd: &EnvdInstance, path: &str) -> Result<()> {
+        Executor::new(envd.clone()).create_dir_all(path).await
+    }
+
+    async fn run_guest_command(
+        envd: EnvdInstance,
+        command: String,
+        args: Vec<String>,
+    ) -> Result<crate::sandbox::process::ProcessOutput> {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        Executor::new(envd).run_command(&command, &args).await
+    }
+
+    async fn sync_writable_volume_filesystems(envd: EnvdInstance) -> Result<()> {
+        let output = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(Self::run_guest_command(
+                envd,
+                "/agentenv/bin/busybox".to_owned(),
+                vec!["sync".to_owned()],
+            ))
+        })
+        .await
+        .context("volume filesystem flush task failed")??;
+        anyhow::ensure!(
+            output.exit_code == 0,
+            "failed to flush writable volume filesystems before pause (exit code {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        );
+        Ok(())
+    }
+
+    async fn mount_guest_path_with_options(
+        envd: EnvdInstance,
+        options: &[&str],
+        source: &str,
+        target: &str,
+    ) -> Result<()> {
+        let mut args = vec!["mount".to_owned(), "-n".to_owned()];
+        args.extend(options.iter().map(|option| (*option).to_owned()));
+        args.extend([source.to_owned(), target.to_owned()]);
+        let output = Self::run_guest_command(
+            envd.clone(),
+            "/agentenv/bin/busybox".to_owned(),
+            args.clone(),
+        )
+        .await?;
+        if output.exit_code == 0 {
+            return Ok(());
+        }
+
+        // A stale snapshot mount must not be accepted just because its target
+        // matches. Remove it and retry with the requested source/options.
+        let _ = Self::run_guest_command(
+            envd.clone(),
+            "/agentenv/bin/busybox".to_owned(),
+            vec!["umount".to_owned(), "-l".to_owned(), target.to_owned()],
+        )
+        .await;
+        let retry = Self::run_guest_command(envd, "/agentenv/bin/busybox".to_owned(), args).await?;
+        if retry.exit_code == 0 {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "failed to mount {} at {} during snapshot launch (exit code {}): {}",
+            source,
+            target,
+            retry.exit_code,
+            retry.stderr.trim()
+        )
     }
 
     /// Pause the running sandbox and create a snapshot for later resume.
@@ -643,6 +943,13 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
+        if self.has_writable_persistent_volumes() {
+            let envd = self
+                .envd_instance
+                .clone()
+                .context("cannot flush writable volumes because envd is not running")?;
+            Self::sync_writable_volume_filesystems(envd).await?;
+        }
         self.fc_instance.pause().await?;
 
         tokio::fs::create_dir_all(snapshot_dir)
@@ -664,11 +971,10 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
-        let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
-            &ConfigManager::global_config().memory_snapshot,
-        );
+        // Local layers are always captured raw; when enabled, compression
+        // happens once at publish time under `[snapshot.publish_compression]`.
         let (mem_layer_path, mem_virtual_size) = self
-            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
+            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, OverlaybdCompactOutput::Raw)
             .await?;
 
         // Build the memory image config: collect parent layers, make runtime
@@ -684,7 +990,7 @@ impl FirecrackerSandbox {
             resume_mem_image_config_path,
             &mem_layer_path,
             snapshot_dir,
-            memory_output,
+            OverlaybdCompactOutput::Raw,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -747,6 +1053,11 @@ impl FirecrackerSandbox {
             .snapshot_extra_drives(snapshot_dir)
             .await
             .context("snapshot extra drives to persistent dir")?;
+        let manifest_extra_drives = snapshot_extra_drives
+            .iter()
+            .filter(|drive| !drive.is_volume())
+            .cloned()
+            .collect::<Vec<_>>();
         let mut snapshot_common = self.launch.common().clone();
         snapshot_common.network_policy = self.current_network_policy.clone();
         snapshot_common.custom_extension_params = self.current_custom_extension_params.clone();
@@ -774,15 +1085,17 @@ impl FirecrackerSandbox {
         });
         snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
 
-        let manifest = FirecrackerSnapshotManifest::new(
+        let mut manifest = FirecrackerSnapshotManifest::new(
             vm_state_path.clone(),
             mem_overlaybd_config.image_config_path.clone(),
             mem_virtual_size,
             base_rootfs_path,
             rootfs_virtual_size,
-            &snapshot_extra_drives,
+            &manifest_extra_drives,
         )
         .context("build firecracker snapshot manifest")?;
+        manifest.volume_drive_slots = snapshot_common.volume_drive_slots;
+        manifest.physical_extra_drive_count = manifest_extra_drives.len();
 
         let snapshot = FirecrackerSnapshotConfig {
             common: snapshot_common,
@@ -831,8 +1144,7 @@ impl FirecrackerSandbox {
     /// Use this when you want to keep the same sandbox instance.
     pub async fn resume(&self) -> Result<()> {
         debug!("resuming paused sandbox in-place");
-        self.fc_instance.resume().await?;
-        Ok(())
+        self.fc_instance.resume().await
     }
 
     /// Resume a new sandbox instance from snapshot config.
@@ -857,6 +1169,9 @@ impl FirecrackerSandbox {
             .await?;
 
         // Clear envd instance
+        if let Some(envd) = self.envd_instance.as_ref() {
+            envd.invalidate();
+        }
         self.envd_instance = None;
 
         // Cleanup ublk device (must happen after FC stop, before network cleanup)
@@ -1113,6 +1428,9 @@ fn relocate_warm_log(src: &Path, target: &Path) -> Result<()> {
 /// since proper delete (via the daemon) was not performed.
 impl Drop for FirecrackerSandbox {
     fn drop(&mut self) {
+        if let Some(envd) = self.envd_instance.as_ref() {
+            envd.invalidate();
+        }
         // Fire the best-effort stop notification (fire-and-forget, never
         // blocking drop) before releasing resources.
         self.custom_extension_hook_guard.take();
@@ -1164,6 +1482,7 @@ impl FirecrackerSandbox {
             mem_snapshot_image_config_path: None,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
+            initial_guest_drive_mounts: Vec::new(),
             live_snapshot_root: None,
             custom_extension_hook_guard: None,
         })
@@ -1284,7 +1603,7 @@ impl FirecrackerSandbox {
         let netns = slot.namespace_path();
         self.network_slot = Some(slot);
         self.network_slot
-            .as_ref()
+            .as_mut()
             .expect("network slot was just assigned")
             .set_egress_policy(config.common.network_policy.as_ref())
             .context("Failed to configure sandbox egress policy")?;
@@ -1330,7 +1649,10 @@ impl FirecrackerSandbox {
             "http://{}:{}",
             interaction_ip, config.common.control_plane_port
         );
-        self.envd_instance = Some(EnvdInstance::new(envd_base_url));
+        self.envd_instance = Some(EnvdInstance::new(
+            envd_base_url,
+            config.common.envd_access_token.clone(),
+        ));
 
         // ── Configure microVM: tools drive as rootfs + user image + extras ──
         self.fc_instance
@@ -1453,9 +1775,41 @@ impl FirecrackerSandbox {
         }
 
         // ── Extra drives ──
-        self.prepare_snapshot_backing_drives(&config.common.extra_drives)
+        let extra_drive_attachments = self
+            .prepare_snapshot_backing_drives(&config.common.extra_drives)
             .await
             .context("prepare snapshot-backed extra drives for resume")?;
+        // Snapshot loading reopens every serialized slot path, so all
+        // placeholders must exist. Restored volumes replace their placeholders
+        // before load; only volumes absent from the source state are patched.
+        let volume_slots = self
+            .prepare_volume_drive_slots(
+                config.common.physical_extra_drive_count,
+                config.common.volume_drive_slots,
+            )
+            .context("prepare reserved volume drive slots for resume")?;
+        let physical_count = config.common.physical_extra_drive_count;
+        anyhow::ensure!(
+            physical_count <= extra_drive_attachments.len(),
+            "snapshot expects {physical_count} physical extra drives, but only {} were prepared",
+            extra_drive_attachments.len()
+        );
+        let volume_drive_attachments = &extra_drive_attachments[physical_count..];
+        anyhow::ensure!(
+            volume_drive_attachments.len() <= volume_slots.len(),
+            "snapshot has more launch-time drives than reserved volume slots"
+        );
+        let has_new_volume_attachments = !self.initial_guest_drive_mounts.is_empty();
+        if !has_new_volume_attachments {
+            for (slot, drive) in volume_slots.iter().zip(volume_drive_attachments) {
+                self.bind_volume_drive_slot(slot, drive).with_context(|| {
+                    format!(
+                        "bind restored volume {} to reserved drive {} before snapshot load",
+                        drive.drive_id, slot.drive_id
+                    )
+                })?;
+            }
+        }
 
         // ── Network + Firecracker spawn ──
         let needs_socket_wait = self.network_slot.is_none();
@@ -1485,7 +1839,7 @@ impl FirecrackerSandbox {
 
             interaction_ip
         };
-        if let Some(slot) = self.network_slot.as_ref() {
+        if let Some(slot) = self.network_slot.as_mut() {
             slot.set_egress_policy(config.common.network_policy.as_ref())
                 .context("Failed to configure sandbox egress policy for resume")?;
         }
@@ -1511,7 +1865,10 @@ impl FirecrackerSandbox {
             "http://{}:{}",
             interaction_ip, config.common.control_plane_port
         );
-        self.envd_instance = Some(EnvdInstance::new(envd_base_url));
+        self.envd_instance = Some(EnvdInstance::new(
+            envd_base_url,
+            config.common.envd_access_token.clone(),
+        ));
 
         let mem_global_config = global_config
             .memory_snapshot
@@ -1555,6 +1912,28 @@ impl FirecrackerSandbox {
             )
             .await?;
 
+        // A volume absent from the source state was loaded as a placeholder.
+        // Replace and PATCH it once so Firecracker reopens the path and reports
+        // the real capacity. Existing volumes were bound before snapshot load.
+        if has_new_volume_attachments {
+            for (slot, drive) in volume_slots.iter().zip(volume_drive_attachments) {
+                self.bind_volume_drive_slot(slot, drive).with_context(|| {
+                    format!(
+                        "bind new volume {} to reserved drive {}",
+                        drive.drive_id, slot.drive_id
+                    )
+                })?;
+                self.fc_instance
+                    .patch_drive_path(&slot.drive_id, &slot.attachment_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "attach new volume {} through reserved drive {}",
+                            drive.drive_id, slot.drive_id
+                        )
+                    })?;
+            }
+        }
         let mmds_metadata = self.mmds_metadata(&config.common);
         self.fc_instance.set_mmds(&mmds_metadata).await?;
 
@@ -1704,8 +2083,34 @@ impl FirecrackerSandbox {
             )
             .await?;
 
-        // Drive 2+ (/dev/vdc...): user extra drives.
-        self.configure_extra_drives(extra_drive_attachments).await?;
+        // Drive 2+ (/dev/vdc...): physical extra drives followed by volume slots.
+        // Firecracker cannot add a virtio-block device after snapshot restore,
+        // so every volume uses a stable reserved slot from the first boot.
+        let physical_count = config.common.physical_extra_drive_count;
+        anyhow::ensure!(
+            physical_count <= extra_drive_attachments.len(),
+            "fresh sandbox expects {physical_count} physical extra drives, but only {} were prepared",
+            extra_drive_attachments.len()
+        );
+        let (physical_drive_attachments, volume_drive_attachments) =
+            extra_drive_attachments.split_at(physical_count);
+        self.configure_extra_drives(physical_drive_attachments)
+            .await?;
+        let volume_slots =
+            self.prepare_volume_drive_slots(physical_count, config.common.volume_drive_slots)?;
+        anyhow::ensure!(
+            volume_drive_attachments.len() <= volume_slots.len(),
+            "fresh sandbox has more volume drives than reserved volume slots"
+        );
+        for (slot, drive) in volume_slots.iter().zip(volume_drive_attachments) {
+            self.bind_volume_drive_slot(slot, drive).with_context(|| {
+                format!(
+                    "bind fresh volume {} to reserved drive {}",
+                    drive.drive_id, slot.drive_id
+                )
+            })?;
+        }
+        self.configure_extra_drives(&volume_slots).await?;
 
         if self.network_slot.is_some() {
             // Network interface.
@@ -1751,10 +2156,63 @@ impl FirecrackerSandbox {
         Ok(())
     }
 
-    async fn prepare_snapshot_backing_drives(&mut self, extra_drives: &[ExtraDrive]) -> Result<()> {
+    fn prepare_volume_drive_slots(
+        &self,
+        physical_extra_drive_count: usize,
+        count: usize,
+    ) -> Result<Vec<DriveMount>> {
+        let mut slots = Vec::with_capacity(count);
+        for index in 0..count {
+            let drive_id = volume_drive_slot_id(index);
+            let attachment_name = format!("{drive_id}.img");
+            let attachment_path = self.work_dir.path().join(&attachment_name);
+            let file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&attachment_path)
+                .with_context(|| {
+                    format!("create reserved volume drive {}", attachment_path.display())
+                })?;
+            file.set_len(VOLUME_DRIVE_PLACEHOLDER_SIZE)
+                .with_context(|| {
+                    format!("size reserved volume drive {}", attachment_path.display())
+                })?;
+            slots.push(DriveMount {
+                drive_id,
+                attachment_path: PathBuf::from(attachment_name),
+                read_only: false,
+            });
+        }
+        anyhow::ensure!(
+            physical_extra_drive_count + slots.len() <= MAX_EXTRA_DRIVES,
+            "{} physical extra drives plus {} volume slots exceed Firecracker's {}-drive limit",
+            physical_extra_drive_count,
+            slots.len(),
+            MAX_EXTRA_DRIVES
+        );
+        Ok(slots)
+    }
+
+    fn bind_volume_drive_slot(&self, slot: &DriveMount, drive: &DriveMount) -> Result<()> {
+        let slot_path = self.work_dir.path().join(&slot.attachment_path);
+        fs::remove_file(&slot_path)
+            .with_context(|| format!("remove reserved volume drive {}", slot_path.display()))?;
+        std::os::unix::fs::symlink(&drive.attachment_path, &slot_path).with_context(|| {
+            format!(
+                "link reserved volume drive {} to {}",
+                slot_path.display(),
+                drive.attachment_path.display()
+            )
+        })
+    }
+
+    async fn prepare_snapshot_backing_drives(
+        &mut self,
+        extra_drives: &[ExtraDrive],
+    ) -> Result<Vec<DriveMount>> {
         if extra_drives.is_empty() {
             self.extra_drive_runtimes.clear();
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let global_config = ConfigManager::global_config();
@@ -1769,10 +2227,9 @@ impl FirecrackerSandbox {
             ExtraDrivePrepareMode::Resume,
         )
         .await?;
-        let (_attachments_already_in_snapshot, extra_drive_runtimes) =
-            prepared_extra_drives.into_parts();
+        let (attachments, extra_drive_runtimes) = prepared_extra_drives.into_parts();
         self.extra_drive_runtimes = extra_drive_runtimes;
-        Ok(())
+        Ok(attachments)
     }
 
     async fn snapshot_extra_drives(&self, snapshot_dir: &Path) -> Result<Vec<ExtraDrive>> {
@@ -1790,11 +2247,25 @@ impl FirecrackerSandbox {
 
         let mut snapped = Vec::with_capacity(extra_drives.len());
         for (drive, runtime) in extra_drives.iter().zip(self.extra_drive_runtimes.iter()) {
+            let persistent_output_dir = drive.snapshot_output_dir();
+            let output_dir = persistent_output_dir.map_or_else(
+                || snapshot_dir.join("drives").join(drive.drive_id()),
+                PathBuf::from,
+            );
+            // A volume reuses its backing directory across pauses. Preserve every
+            // sealed upper under a unique name so a later restack cannot overwrite
+            // a lower that is still referenced by image.json.
+            let snapshot_layer_file_name = persistent_output_dir.map_or_else(
+                || "snapshot.commit".to_owned(),
+                |_| format!("snapshot-{}.commit", Uuid::now_v7().simple()),
+            );
             let snapshot_image_config_path = restack_snapshot_overlaybd_device(
                 &runtime.device,
                 drive.read_only(),
                 &runtime.image_config_path,
-                &snapshot_dir.join("drives").join(drive.drive_id()),
+                &output_dir,
+                &snapshot_layer_file_name,
+                "drive",
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
@@ -1806,6 +2277,45 @@ impl FirecrackerSandbox {
         }
 
         Ok(snapped)
+    }
+
+    fn has_writable_persistent_volumes(&self) -> bool {
+        self.launch
+            .common()
+            .extra_drives
+            .iter()
+            .any(|drive| !drive.read_only() && drive.snapshot_output_dir().is_some())
+    }
+
+    async fn snapshot_persistent_volume_drives(&self) -> Result<()> {
+        let extra_drives = &self.launch.common().extra_drives;
+        anyhow::ensure!(
+            extra_drives.len() == self.extra_drive_runtimes.len(),
+            "extra drive bookkeeping mismatch: {} configured drives but {} prepared devices",
+            extra_drives.len(),
+            self.extra_drive_runtimes.len()
+        );
+
+        for (drive, runtime) in extra_drives.iter().zip(&self.extra_drive_runtimes) {
+            let Some(output_dir) = drive.snapshot_output_dir() else {
+                continue;
+            };
+            if drive.read_only() {
+                continue;
+            }
+            let snapshot_layer_file_name = format!("snapshot-{}.commit", Uuid::now_v7().simple());
+            restack_snapshot_overlaybd_device(
+                &runtime.device,
+                false,
+                &runtime.image_config_path,
+                output_dir,
+                &snapshot_layer_file_name,
+                "volume",
+            )
+            .await
+            .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
+        }
+        Ok(())
     }
 
     fn runtime_image_config_paths(&self) -> Vec<PathBuf> {
@@ -1881,7 +2391,7 @@ async fn copy_cow(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cfg::ToolsConfig;
-    use crate::sandbox::SandboxExecutor;
+    use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
     use std::collections::HashMap;
 
@@ -1892,6 +2402,26 @@ mod tests {
             "0.1.0".to_string(),
             "user-image.json".into(),
         )
+    }
+
+    #[test]
+    fn fresh_volume_drives_use_reserved_slots() -> Result<()> {
+        let work_base = TempDir::new()?;
+        let physical_drive = ExtraDrive::try_new_overlaybd("data", "/tmp/data-image.json", true)?;
+        let volume_drive =
+            ExtraDrive::try_new_overlaybd("volume", "/tmp/volume-image.json", false)?
+                .with_volume_snapshot_output_dir(None);
+        let mut config = fresh_config();
+        config.common.firecracker_work_base_dir = Some(work_base.path().to_path_buf());
+        config.common.extra_drives = vec![volume_drive.clone(), physical_drive.clone()];
+
+        let sandbox = FirecrackerSandbox::new(config)?;
+        let common = sandbox.launch.common();
+
+        assert_eq!(common.physical_extra_drive_count, 1);
+        assert!(common.volume_drive_slots >= 1);
+        assert_eq!(common.extra_drives, vec![physical_drive, volume_drive]);
+        Ok(())
     }
 
     fn overlaybd_config() -> FirecrackerSandboxConfig {
@@ -2057,6 +2587,52 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_config_runtime_identity_replaces_source_auth() -> Result<()> {
+        let source_id = SandboxId::new();
+        let child_id = SandboxId::new();
+        let generator = SandboxAccessTokenGenerator::new("fork-test-seed")?;
+        let source_token = generator.generate(source_id);
+        let child_token = generator.generate(child_id);
+        let mut common = fresh_config().common;
+        common.mmds_metadata =
+            Some(MmdsMetadata::new(source_id, "snapshot").with_access_token(Some(&source_token)));
+        common.envd_access_token = Some(source_token.clone());
+        let snapshot = FirecrackerSnapshotConfig {
+            common,
+            vm_state_path: "snapshot/vm_state.bin".into(),
+            mem_overlaybd_config: OverlaybdConfig {
+                image_config_path: "snapshot/mem_image.json".into(),
+                read_only: true,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            },
+            mem_virtual_size: 4096,
+            managed_snapshot_root: None,
+        };
+
+        let child = FirecrackerSandbox::from_snapshot_config_with_override(
+            snapshot,
+            child_id,
+            Some(child_token.clone()),
+        )?;
+        let common = child.launch.common();
+        let metadata = common.mmds_metadata.as_ref().expect("child MMDS metadata");
+        let expected =
+            MmdsMetadata::new(child_id, "snapshot").with_access_token(Some(&child_token));
+
+        assert_eq!(child.id, child_id);
+        assert_eq!(common.envd_access_token.as_ref(), Some(&child_token));
+        assert_eq!(metadata.sandbox_id, child_id.to_string());
+        assert_eq!(metadata.access_token_hash, expected.access_token_hash);
+        assert_ne!(
+            metadata.access_token_hash,
+            MmdsMetadata::new(source_id, "snapshot")
+                .with_access_token(Some(&source_token))
+                .access_token_hash
+        );
+        Ok(())
+    }
+
+    #[test]
     fn paused_state_without_tools_drive_version_remains_readable_but_not_resumable() -> Result<()> {
         let temp = TempDir::new()?;
         let vm_state_path = temp.path().join("vm-state.bin");
@@ -2135,10 +2711,13 @@ mod tests {
     #[tokio::test]
     async fn stop_without_process_clears_envd_instance() -> Result<()> {
         let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
-        sandbox.envd_instance = Some(EnvdInstance::new(format!(
-            "http://127.0.0.1:{}",
-            ToolsConfig::default().control_plane_port
-        )));
+        sandbox.envd_instance = Some(EnvdInstance::new(
+            format!(
+                "http://127.0.0.1:{}",
+                ToolsConfig::default().control_plane_port
+            ),
+            None,
+        ));
 
         sandbox.stop().await?;
 
@@ -2235,7 +2814,10 @@ mod tests {
             snapshot_id: "tpl-test".to_string(),
             network: None,
             extra_mmds: serde_json::Map::new(),
+            extra_drives: Vec::new(),
+            extra_drives_in_snapshot: false,
             custom_extension_params: None,
+            envd_access_token: None,
         };
 
         let snapshot_config =

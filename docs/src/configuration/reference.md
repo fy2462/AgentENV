@@ -251,6 +251,25 @@ In-guest `envd` daemon settings.
 | `init_timeout_secs` | integer | `60` | Max seconds to wait for envd to become ready after VM start |
 | `poll_ms` | integer | `3` | Poll interval (ms) for envd health check retries |
 
+## `[sandbox]`
+
+Sandbox control communication settings.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `access_token_hash_seed` | string | auto-generated | Optional override for the secret used to derive sandbox envd and traffic access tokens. When unset, normal server startup creates and reuses `$AENV_HOME/secrets/sandbox-access-token-hash-seed`. Configure an explicit shared value for clustered deployments. |
+
+The managed seed is node-local persistent state and must be included in backups of `$AENV_HOME`. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.
+
+Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.
+
+## `[volume]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_size_mb` | integer | `262144` | Maximum persistent volume size in MiB (256 GiB). |
+| `max_volume_count` | integer | `4` | Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit. |
+
 ## `[orchestrator]`
 
 Sandbox lifecycle management.
@@ -277,7 +296,7 @@ Component sections:
 |---------|-----|------|---------|-------------|
 | `[pool.network]` | `maintenance_enabled` | boolean | `true` | Enable the background network-slot maintenance worker |
 | `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool |
-| `[pool.block]` | `startup_prewarm` | boolean | `true` | Prewarm block devices after the first reusable image shape is known |
+| `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
 | `[pool.firecracker]` | `startup_prewarm` | boolean | `true` | Spawn warm Firecracker entries up to the low watermark during server startup |
@@ -384,6 +403,28 @@ Source-registry image publication. Only takes effect when `snapshot.repository_b
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | When enabled, publishing a snapshot also pushes its rootfs as an OverlayBD-native OCI image tag `agentenv-snapshot-{snapshot_id}` to the original source registry. Requires source images to be OverlayBD-native in that registry and push credentials in the Docker config (`~/.docker/config.json`). Existing remote layers are referenced by digest; only new delta layers are uploaded. The published reference is exposed as `imageRef` in snapshot APIs. Memory and VM-state artifacts always remain in the snapshot repository. |
 
+## `[snapshot.publish_compression]`
+
+Publish-time compression for snapshot layers uploaded to OSS/ACR. Local layers
+always stay raw, so local resume pays no decompression cost; enabled by default,
+memory layers and incremental read-write layers are compressed once as they
+are uploaded, cutting network bytes for cross-node resume. This is the only
+compression switch; the legacy capture-time knobs under `[memory_snapshot]`
+and `[template_build]` were removed from the configuration schema.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `true` | Compress memory layers and incremental read-write layers when uploading them to OSS/ACR. |
+| `algorithm` | string | `"lz4"` | Compression algorithm. Valid values are only `lz4` and `zstd`. |
+| `workers` | integer | `1` | Number of blocking threads used to compress 4 KiB blocks within a layer. `1` is sequential; higher values run in parallel without changing the output layout. Clamped to 64. |
+
+Known impact: compressed layers are recorded without a layer uuid (ZFile
+layers carry no LSMT uuid), so P2P uuid-keyed acceleration does not apply to
+them. Snapshot P2P publication also skips digest-keyed advertisements for
+local raw layers whose digest is absent from the committed record — the
+record names the compressed bytes, so the raw digest key would never be
+looked up by consumers.
+
 ## `[backend.posix_fs]`
 
 POSIX filesystem-backed snapshot repository configuration. This section is used when `snapshot.repository_backend = "posix_fs"`.
@@ -410,6 +451,7 @@ OSS-backed snapshot repository configuration. This section is required when `sna
 | `access_key_secret` | string | unset | Static OSS access key secret. Required when `credential_process` is not set |
 | `security_token` | string | unset | Optional session token paired with static access key credentials |
 | `region` | string | none | Region passed to the S3-compatible object-store client; required for current OSS backend |
+| `addressing_style` | string | auto-detect | Bucket addressing style, `"virtual"` or `"path"`. When unset, the backend auto-detects: Alibaba OSS and bucket-in-endpoint hosts use virtual-host style, other endpoints default to path style. Set either value when a provider's required or preferred style differs from the detected default |
 | `cache_max_size_gb` | integer | `10` | Maximum size of the node-local OSS artifact cache in GiB |
 
 Notes:
@@ -417,6 +459,18 @@ Notes:
 - `credential_process` and static access key settings are mutually exclusive in practice; when `credential_process` is set, the backend ignores static credential fields.
 - `credential_process` should be written as a portable argv-style command line. Avoid `$VAR`, backticks, `$(...)`, pipes, and shell builtins.
 - Although the config section is still named `oss`, the runtime path is implemented via a shared S3-compatible client, so `region` must be configured.
+- Leave `addressing_style` unset when endpoint-based detection is correct. Set it to `"virtual"` or `"path"` when the provider's required or preferred style differs from the detected default; for example, some Tigris or Cloudflare R2 deployments use virtual-host addressing.
+- The setting covers both halves of the data path: the snapshot repository client (metadata and artifact upload/download) and the generated OverlayBD runtime config (`ossConfig.defaultAddressingStyle`), which the runtime uses when reading remote managed snapshot layers during sandbox restore.
+
+For an S3-compatible provider where virtual-host addressing is required or preferred — for example [Tigris](https://www.tigrisdata.com/docs/) — set `addressing_style` explicitly:
+
+```toml
+[backend.oss]
+endpoint = "https://t3.storage.dev"
+bucket = "agentenv-snapshots"
+region = "auto"
+addressing_style = "virtual"
+```
 
 Other path override:
 
@@ -491,9 +545,7 @@ the default path on every startup.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
-| `track_dirty_pages` | bool | `false` | Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true` to enable it. |
-| `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
-| `compression_algorithm` | string | `"lz4"` | Compression algorithm for memory snapshot layers. Valid values are only `lz4` and `zstd`. |
+| `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
 
 ## `[memory_snapshot.background_download]`
 

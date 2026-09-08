@@ -321,23 +321,19 @@ impl UblkDaemonServer {
         self.resize_tool = Some(resize_tool);
     }
 
+    pub async fn detect_ublk_features(&self) -> Result<u64> {
+        detect_ublk_features(&self.ctrl_ring).await
+    }
+
     /// Enable warm pooling with the given configuration.
     /// Must be called before `run()`.
-    pub async fn enable_pool(&mut self, config: PoolConfig) -> Result<()> {
-        // Detect ublk features at startup.
-        let features = detect_ublk_features(&self.ctrl_ring).await?;
-        tracing::info!(
-            features = format!("{:#x}", features),
-            update_size_supported = features & ublk_caps::UBLK_F_UPDATE_SIZE != 0,
-            "detected ublk features"
-        );
+    pub fn enable_pool(&mut self, config: PoolConfig, features: u64) {
         self.pool_state = Some(Arc::new(PoolState::new(
             config,
             features,
             self.default_image_service.clone(),
             self.pool_placeholder_dir(),
         )));
-        Ok(())
     }
 
     /// Daemon-owned directory for warm-pool placeholder images, kept separate
@@ -1003,12 +999,21 @@ async fn handle_restack_snapshot(
         )
     })?;
 
+    // Best-effort usage observability; never fails the restack itself.
+    let data_stat = image.data_stat().await.ok();
+    let image_vf: Arc<dyn overlaybd::virtual_file::VirtualFile> = image.clone();
+    let ext4_used_bytes = overlaybd::ext4_stat::ext4_used_bytes(&image_vf).await.ok();
+
     tracing::info!(
         dev_id,
         output = %output_layer_path.display(),
         "ublk daemon restack snapshot completed"
     );
-    Ok(DaemonResponse::RestackSnapshotCreated { descriptor })
+    Ok(DaemonResponse::RestackSnapshotCreated {
+        descriptor,
+        data_stat,
+        ext4_used_bytes,
+    })
 }
 
 // ── Pool handlers ───────────────────────────────────────────────────────────
