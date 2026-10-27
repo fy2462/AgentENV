@@ -1,6 +1,7 @@
 mod admin;
 mod attached_drives;
 pub(crate) mod auth;
+pub(crate) mod image_build;
 mod pagination;
 mod sandbox;
 mod snapshots;
@@ -18,7 +19,7 @@ use crate::api_key::ApiKey;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::Orchestrator;
-use crate::snapshot::repository::RepositoryError;
+use crate::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
 use crate::volume::VolumeManager;
@@ -26,6 +27,28 @@ use agentenv_http_server::{apis, models};
 
 #[derive(Clone, Debug)]
 pub struct Claims;
+
+impl From<models::LogLevel> for crate::logging::LogLevel {
+    fn from(level: models::LogLevel) -> Self {
+        match level {
+            models::LogLevel::Debug => Self::Debug,
+            models::LogLevel::Info => Self::Info,
+            models::LogLevel::Warn => Self::Warn,
+            models::LogLevel::Error => Self::Error,
+        }
+    }
+}
+
+impl From<crate::logging::LogLevel> for models::LogLevel {
+    fn from(level: crate::logging::LogLevel) -> Self {
+        match level {
+            crate::logging::LogLevel::Debug => Self::Debug,
+            crate::logging::LogLevel::Info => Self::Info,
+            crate::logging::LogLevel::Warn => Self::Warn,
+            crate::logging::LogLevel::Error => Self::Error,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ApiImpl {
@@ -38,6 +61,8 @@ pub struct ApiImpl {
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
     api_key: ApiKey,
+    build_sessions: Arc<image_build::BuildSessions>,
+    build_logs: crate::template::logs::BuildLogs,
 }
 
 impl ApiImpl {
@@ -62,6 +87,8 @@ impl ApiImpl {
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
             api_key,
+            build_sessions: Arc::new(image_build::BuildSessions::default()),
+            build_logs: Default::default(),
         }
     }
 

@@ -249,7 +249,10 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 extra_drives_in_snapshot: false,
                 timeout: Some(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,
-                user_metadata: None,
+                user_metadata: Some(std::collections::HashMap::from([(
+                    "team".to_string(),
+                    "capture-test".to_string(),
+                )])),
                 env_vars: None,
                 network_policy: SandboxNetworkPolicy::default(),
                 auto_resume: false,
@@ -278,6 +281,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 start_cmd,
                 ready_cmd,
                 context,
+                shell: None,
             }) if start_cmd == "sleep 1000000"
                 && ready_cmd == "test -f base.txt"
                 && context.workdir == "/workspace"
@@ -285,26 +289,27 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
 
         let published_alias = format!("orchestrator-captured-{}", Uuid::now_v7());
         let sandbox_id_str = sandbox_id.to_string();
-        let published = snapshot_manager
-            .publish_captured(
-                SnapshotPublishMetadata {
-                    id: SnapshotId::generate(),
-                    alias: Some(SnapshotAlias::parse(&published_alias)?),
-                    source: SnapshotPublishSource::Sandbox {
-                        source_sandbox_id: sandbox_id_str.clone(),
-                    },
-                    context: capture.metadata.context.clone(),
-                    startup: capture.metadata.startup.clone(),
-                    resources: capture.metadata.resources,
-                    runtime_versions: capture.metadata.runtime_versions.clone(),
-                    virtualization_mode: capture.metadata.virtualization_mode,
-                    image_configs: capture.metadata.image_configs.clone(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
+        let published = agentenv::sandbox::publish_captured(
+            &snapshot_manager,
+            SnapshotPublishMetadata {
+                id: SnapshotId::generate(),
+                alias: Some(SnapshotAlias::parse(&published_alias)?),
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: sandbox_id_str.clone(),
+                    source_sandbox_metadata: capture.metadata.user_metadata.clone(),
                 },
-                capture.captured_snapshot,
-            )
-            .await?;
+                context: capture.metadata.context.clone(),
+                startup: capture.metadata.startup.clone(),
+                resources: capture.metadata.resources,
+                runtime_versions: capture.metadata.runtime_versions.clone(),
+                virtualization_mode: capture.metadata.virtualization_mode,
+                image_configs: capture.metadata.image_configs.clone(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
+            },
+            capture.captured_snapshot,
+        )
+        .await?;
         let record = snapshot_manager
             .get(published.id.to_string())
             .await?
@@ -312,8 +317,10 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         assert!(matches!(
             &record.source,
             SnapshotSource::Sandbox {
-                source_sandbox_id
+                source_sandbox_id,
+                source_sandbox_metadata: Some(metadata),
             } if source_sandbox_id == &sandbox_id_str
+                && metadata.get("team").map(String::as_str) == Some("capture-test")
         ));
         let committed = record
             .committed
@@ -334,6 +341,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 start_cmd,
                 ready_cmd,
                 context,
+                shell: None,
             }) if start_cmd == "sleep 1000000"
                 && ready_cmd == "test -f base.txt"
                 && context.workdir == "/workspace"

@@ -5,18 +5,17 @@ use anyhow::Context;
 use futures::{stream, StreamExt};
 use tracing::warn;
 
+use super::backends::build_snapshot_backend;
+use super::catalog::SnapshotCatalog;
 use super::p2p::SnapshotP2pArtifact;
+use super::publish::spawn_startup_manifest;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
+use super::{SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver};
 use crate::p2p::P2pTransport;
-use crate::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
-};
-use crate::snapshot::repository::backends::build_snapshot_backend;
-use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
-use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
+use crate::repository::Repository;
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
-    SnapshotRecord,
+    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SandboxSnapshotManifest, SnapshotId,
+    SnapshotPublishMetadata, SnapshotRecord,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
@@ -59,12 +58,12 @@ fn committed_memory_layer_digests(layers: &[ManagedLayer]) -> HashSet<String> {
 /// Coordinates committed snapshot lifecycle operations over repository-backed state.
 ///
 /// Durable reachability of committed snapshots is owned entirely by the
-/// [`SnapshotRepository`] (PosixFS `managed-layers/`, OSS object storage, or the
+/// [`Repository`] (PosixFS `managed-layers/`, OSS object storage, or the
 /// source registry). The node-local overlaybd layer cache (`image-cache/commits/`)
 /// is reclaimable - committed snapshots never pin it - so this manager records no
 /// local image ref pins.
 pub struct SnapshotManager {
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
 }
@@ -82,7 +81,7 @@ impl SnapshotManager {
 
     /// Builds a manager from the given components.
     pub fn from_parts(
-        repository: Arc<dyn SnapshotRepository>,
+        repository: Arc<dyn Repository>,
         runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Self {
@@ -95,62 +94,63 @@ impl SnapshotManager {
 
     /// Returns the configured durable repository so sibling resource catalogs
     /// can share the same PosixFS/OSS source of truth.
-    pub fn repository(&self) -> Arc<dyn SnapshotRepository> {
+    pub fn repository(&self) -> Arc<dyn Repository> {
         Arc::clone(&self.repository)
     }
 
     pub async fn create(
         &self,
         record: SnapshotRecord,
-    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         self.repository.create(record).await
     }
 
-    #[tracing::instrument(skip(self, metadata, manifest), fields(snapshot_id = %metadata.id))]
+    #[tracing::instrument(skip(self, metadata, manifest, recording), fields(snapshot_id = %metadata.id))]
     pub async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
-    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let record = self
-            .repository
-            .publish(metadata.clone(), manifest.clone())
-            .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
-        Ok(record)
+        manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
+    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
+        self.publish_with_recording(metadata, manifest, recording)
+            .await
     }
 
-    #[tracing::instrument(skip(self, metadata), fields(snapshot_id = %metadata.id))]
-    pub async fn publish_captured(
+    /// Publishes into the repository, then starts the startup-manifest
+    /// continuation and best-effort P2P publication. A failed publish drops
+    /// `recording`, whose recorder keeps its own capture lease.
+    async fn publish_with_recording(
         &self,
         metadata: SnapshotPublishMetadata,
-        captured_snapshot: CapturedSandboxSnapshot,
-    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let manifest = captured_snapshot
-            .downcast_ref::<FirecrackerCapturedSnapshot>()
-            .map(|snapshot| snapshot.manifest().clone())
-            .ok_or_else(|| RepositoryError::Unsupported {
-                feature: "publishing captured snapshots for this sandbox backend".to_string(),
-            })?;
-
-        let record = self
+        manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
+    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
+        let publication = self
             .repository
-            .publish(metadata.clone(), manifest.clone())
+            .publish_with_local_layers(metadata, manifest.clone())
             .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
-        Ok(record)
+        if let Some(recording) = recording {
+            spawn_startup_manifest(
+                Arc::clone(&self.repository),
+                publication.record.id.clone(),
+                recording,
+            );
+        }
+        self.publish_p2p_artifacts(&publication, &manifest).await;
+        Ok(publication.record)
     }
 
     /// Best effort attempt to publish snapshot artifacts to P2P.
-    #[tracing::instrument(skip(self, record, manifest), fields(snapshot_id = %record.id))]
+    #[tracing::instrument(skip(self, publication, manifest), fields(snapshot_id = %publication.record.id))]
     async fn publish_p2p_artifacts(
         &self,
-        record: &SnapshotRecord,
-        manifest: &FirecrackerSnapshotManifest,
+        publication: &SnapshotPublication,
+        manifest: &SandboxSnapshotManifest,
     ) {
         let Some(transport) = self.p2p_transport.as_ref() else {
             return;
         };
+        let record = &publication.record;
         let snapshot_id = &record.id;
         let Some(committed) = record.committed.as_ref() else {
             return;
@@ -170,6 +170,16 @@ impl SnapshotManager {
                 manifest_bytes,
             ),
         ];
+
+        // Uploaded descriptors describe the committed bytes, including compressed
+        // and dense-exported layers. Keep their files alive until P2P copies finish.
+        artifacts.extend(publication.local_layers.iter().map(|layer| {
+            SnapshotP2pArtifact::content_addressed_overlaybd_layer(
+                layer.path(),
+                layer.digest(),
+                layer.size(),
+            )
+        }));
 
         // Collect any overlaybd layers referenced by this snapshot's runtime images.
         let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
@@ -205,6 +215,10 @@ impl SnapshotManager {
                 &drive_uuids,
             ));
         }
+
+        // An unchanged local layer may appear in both the uploads and image config.
+        let mut keys = HashSet::new();
+        artifacts.retain(|artifact| keys.insert(artifact.key.clone()));
 
         // Publish all artifacts concurrently, but don't fail if any individual artifact fails to publish.
         stream::iter(artifacts)
@@ -298,7 +312,7 @@ impl SnapshotManager {
     pub async fn try_start_build(
         &self,
         id: &SnapshotId,
-    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         self.repository.try_start_build(id).await
     }
 
@@ -307,7 +321,7 @@ impl SnapshotManager {
         &self,
         id: &SnapshotId,
         reason: crate::snapshot::TemplateBuildErrorReason,
-    ) -> crate::snapshot::RepositoryResult<()> {
+    ) -> crate::repository::RepositoryResult<()> {
         self.repository.mark_build_error(id, reason).await
     }
 }
@@ -317,9 +331,9 @@ mod tests {
     use super::*;
     use crate::overlaybd::layer_key_from_digest;
     use crate::p2p::mock::MockTransport;
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::p2p::fixed_artifact_key;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata};
     use std::path::Path;
     use tempfile::TempDir;
@@ -345,9 +359,75 @@ mod tests {
             ..SnapshotPublishMetadata::mock()
         };
         manager
-            .publish(metadata, manifest)
+            .publish(metadata, manifest, None)
             .await
             .expect("seed publish should work");
+    }
+
+    struct LeaseProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for LeaseProbe {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A recording whose recorder holds a capture lease until `release` fires.
+    fn pending_recording() -> (
+        crate::snapshot::StartupRecording,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let recording = crate::snapshot::StartupRecording::spawn_with_capture_lease(
+            async move {
+                let _ = wait.await;
+                None
+            },
+            Arc::new(LeaseProbe(Arc::clone(&dropped))),
+        );
+        (recording, release, dropped)
+    }
+
+    async fn wait_for_lease_release(dropped: &std::sync::atomic::AtomicBool) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recorder release");
+    }
+
+    #[tokio::test]
+    async fn failed_publish_keeps_capture_lease_until_pending_recorder_finishes() {
+        let tempdir = TempDir::new().unwrap();
+        let manager = test_manager(tempdir.path());
+        let (_, _, mut manifest) = write_mock_built_artifacts(tempdir.path()).unwrap();
+        manifest.vm_state.path = tempdir.path().join("missing-vm-state");
+        let (recording, release, dropped) = pending_recording();
+        assert!(manager
+            .publish(SnapshotPublishMetadata::mock(), manifest, Some(recording))
+            .await
+            .is_err());
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        wait_for_lease_release(&dropped).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_publish_keeps_capture_lease_until_pending_recorder_finishes() {
+        let tempdir = TempDir::new().unwrap();
+        let manager = test_manager(tempdir.path());
+        let (_, _, manifest) = write_mock_built_artifacts(tempdir.path()).unwrap();
+        let (recording, release, dropped) = pending_recording();
+        let publish = manager.publish(SnapshotPublishMetadata::mock(), manifest, Some(recording));
+        // Cancel before the first poll; the recorder is already detached.
+        drop(publish);
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        wait_for_lease_release(&dropped).await;
     }
 
     #[tokio::test]
@@ -371,7 +451,7 @@ mod tests {
         assert_eq!(loaded.id, snapshot_id);
 
         let listed = manager
-            .list(crate::snapshot::repository::SnapshotListFilter::matches_all())
+            .list(SnapshotListFilter::matches_all())
             .await
             .expect("list should work");
         assert_eq!(listed.len(), 1);
@@ -425,7 +505,7 @@ mod tests {
         };
 
         manager
-            .publish(metadata, manifest)
+            .publish(metadata, manifest, None)
             .await
             .expect("publish should commit");
 
@@ -452,5 +532,106 @@ mod tests {
             .await
             .expect("lookup rootfs layer")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn posix_resolve_never_repairs_missing_files_from_peers() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: tempdir.path().join("repository"),
+            cache_root: Some(tempdir.path().join("runtime-cache")),
+            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
+        })
+        .expect("posix backend");
+        let repository = backend.repository();
+        let p2p = Arc::new(MockTransport::default());
+        let manager = SnapshotManager::from_parts(
+            Arc::clone(&repository),
+            backend.runtime_resolver(),
+            Some(p2p.clone()),
+        );
+        let workspace = TempDir::new().expect("tempdir should exist");
+        let (_, _, manifest) =
+            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
+        let snapshot_id = SnapshotId::generate();
+        let metadata = SnapshotPublishMetadata {
+            id: snapshot_id.clone(),
+            ..SnapshotPublishMetadata::mock()
+        };
+        let record = manager
+            .publish(metadata, manifest, None)
+            .await
+            .expect("publish should commit");
+        let crate::repository::BlobLocation::Local(vm_state) = repository
+            .locate_blob(&crate::repository::BlobKey::Snapshot(
+                snapshot_id.clone(),
+                crate::repository::SnapshotFile::VmState,
+            ))
+            .expect("posix locates snapshot files")
+        else {
+            panic!("posix reads snapshot files in place");
+        };
+        std::fs::remove_file(&vm_state).expect("remove vm state");
+
+        // Peers still have the file, even given to the resolver directly.
+        let resolver = crate::snapshot::resolver::RepositoryRuntimeResolver::new(
+            repository,
+            crate::snapshot::artifact_cache::LocalArtifactCache::new(
+                tempdir.path().join("other-cache"),
+                None,
+            )
+            .expect("local cache"),
+            tempdir.path().join("other-runtime"),
+            crate::image::cache::local_image_services_from_global_config().overlaybd_layers,
+            Some(p2p),
+        );
+        let error = resolver
+            .resolve(Arc::new(record))
+            .await
+            .expect_err("missing vm state must not be fetched from peers");
+        assert!(matches!(
+            error,
+            crate::repository::RepositoryError::ArtifactNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_repository_commit_does_not_publish_to_p2p() {
+        let p2p = Arc::new(MockTransport::default());
+        let manager = SnapshotManager::from_parts(
+            Arc::new(crate::snapshot::mock::MockRepository),
+            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            Some(p2p.clone()),
+        );
+        let workspace = TempDir::new().expect("tempdir");
+        let (_, _, manifest) = write_mock_built_artifacts(workspace.path()).expect("artifacts");
+        manager
+            .publish(SnapshotPublishMetadata::mock(), manifest, None)
+            .await
+            .expect_err("repository rejects publication");
+        assert_eq!(
+            p2p.publish_count.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_p2p_publication_does_not_undo_repository_commit() {
+        let workspace = TempDir::new().expect("tempdir");
+        let mut manager = test_manager(workspace.path());
+        let p2p = Arc::new(MockTransport::default());
+        p2p.fail_publish
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        manager.p2p_transport = Some(p2p.clone());
+        let (_, _, manifest) =
+            write_mock_built_artifacts(&workspace.path().join("artifacts")).expect("artifacts");
+        let stored = manager
+            .publish(SnapshotPublishMetadata::mock(), manifest, None)
+            .await
+            .expect("P2P failure must not fail the commit");
+        assert!(p2p.publish_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        let loaded = manager.get(stored.id.to_string()).await.unwrap().unwrap();
+        assert_eq!(loaded.id, stored.id);
+        assert!(loaded.committed.is_some());
     }
 }

@@ -30,7 +30,7 @@ runs:
         echo "AENV_DEPS_PATH=${deps_path}" >> "$GITHUB_ENV"
         echo "deps_path=${deps_path}" >> "$GITHUB_OUTPUT"
 
-    - name: Ensure sandbox runtime path is writable
+    - name: Prepare sandbox filesystem
       shell: bash
       run: |
         set -euo pipefail
@@ -49,6 +49,10 @@ runs:
         sudo mkdir -p "$home_path"
         sudo chown -R "$(id -u):$(id -g)" "$home_path"
 
+        # overlaybd-apply checks this default path before parsing its config argument.
+        sudo mkdir -p /etc/overlaybd
+        sudo sh -c 'test -e /etc/overlaybd/overlaybd.json || printf "{}\n" > /etc/overlaybd/overlaybd.json'
+
     - name: Compute sandbox cache version
       id: sandbox-cache-version
       shell: bash
@@ -56,8 +60,8 @@ runs:
         set -euo pipefail
         files=(
           config/deps_manifest.toml
-          src/setup/deps.rs
-          src/setup/overlaybd.rs
+          src/deps/mod.rs
+          src/deps/overlaybd_tools.rs
           storage/overlaybd/src/tools/packaging.rs
           storage/overlaybd/src/tools/oci.rs
           .github/actions/sandbox-ci-setup/action.yml

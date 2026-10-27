@@ -59,6 +59,7 @@ type Server struct {
 	queryOnlyScheduler schedulerv1.SchedulerClient
 	httpClient         *http.Client
 	apiKey             []byte
+	proxyTransport     *http.Transport
 	requestTimeout     time.Duration
 	maxRespSize        int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
@@ -87,12 +88,30 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		scheduler:           schedulerClient,
 		queryOnlyScheduler:  queryOnlyScheduler,
 		httpClient:          &http.Client{},
+		proxyTransport:      newProxyTransport(),
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
 		apiKey:              []byte(options.APIKey),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
 	}, nil
+}
+
+// newProxyTransport builds the transport shared by all reverse proxies
+// created by proxyRequest. The net/http defaults (MaxIdleConns: 100,
+// MaxIdleConnsPerHost: 2) are sized for a single application talking to a
+// handful of hosts; a gateway fans out to many nodes with high per-node
+// concurrency, so undersized idle pools cause constant connection churn and
+// can surface spurious "http: putIdleConn: too many idle connections"
+// failures on unrelated in-flight requests (see golang/go#13801 and
+// golang/go#6785).
+func newProxyTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Unbounded globally; per-host usage is bounded by MaxIdleConnsPerHost
+	// and IdleConnTimeout (90s by default).
+	transport.MaxIdleConns = 0
+	transport.MaxIdleConnsPerHost = 128
+	return transport
 }
 
 func (s *Server) SandboxProxyDomains() []string {
@@ -185,6 +204,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if hostRoute == nil && !hasProxyRoutingHeaders(r.Header) {
+		if isSandboxMetricsListRequest(r) {
+			setGatewayRouteSource(w, routeSourceGateway)
+			s.handleSandboxMetricsList(w, r, routingCtx)
+			return
+		}
 		if isClusterListRequest(r) {
 			setGatewayRouteSource(w, routeSourceGateway)
 			s.handleClusterList(w, r, routingCtx)
@@ -201,15 +225,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sandboxID, hasSandbox := "", false
+	buildReadRequest := false
 	routeSource := routeSourceHeader
 	if hostRoute != nil {
 		s.logHostRoutingHeaderConflicts(r, hostRoute)
 		sandboxID = hostRoute.sandboxID
 		hasSandbox = true
 		routeSource = routeSourceHost
-	} else if isSandboxControlPlaneRequest(r) {
-		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
-		routeSource = routeSourcePath
+	} else if route, ok := matchPathRoute(r.Method, r.URL.Path); ok {
+		if route.allocatesBuild() {
+			routeSource = routeSourceSchedule
+		} else {
+			sandboxID, hasSandbox = route.id, true
+			buildReadRequest = route.owner == ownerBuildRead
+			routeSource = routeSourcePath
+		}
 	} else {
 		sandboxID, hasSandbox = sandboxIDFromHeaders(r.Header)
 	}
@@ -223,12 +253,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		rpcStart := time.Now()
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
-		if err != nil {
+		if buildReadRequest && status.Code(err) == codes.NotFound {
+			// Completed and legacy builds use the shared template repository.
+			hasSandbox = false
+			routeSource = routeSourceSchedule
+			setGatewayRouteSource(w, routeSource)
+		} else if err != nil {
 			s.writeSchedulerError(w, err)
 			return
+		} else {
+			node = resp.GetNode()
 		}
-		node = resp.GetNode()
-	} else {
+	}
+	if !hasSandbox {
 		hint, err := buildScheduleHint(r)
 		if err != nil {
 			// this only happens it cannot read request body, so the request cannot continue
@@ -269,7 +306,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
+	// Data-plane requests may legitimately wait for a guest service longer than
+	// the route-resolution deadline. Keep the client context after the node has
+	// been selected; control-plane and scheduled requests retain the bounded
+	// gateway request timeout.
+	upstreamCtx, cancelUpstream := requestContextForProxy(
+		r,
+		routingCtx,
+		longLived || isDataPlaneRouteSource(routeSource),
+	)
 	defer cancelUpstream()
 
 	s.proxyRequest(
@@ -325,6 +370,7 @@ func (s *Server) proxyRequest(
 	}
 
 	proxy := &httputil.ReverseProxy{
+		Transport: s.proxyTransport,
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.Out.URL.Scheme = upstreamURL.Scheme
 			req.Out.URL.Host = upstreamURL.Host
@@ -352,7 +398,7 @@ func (s *Server) proxyRequest(
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				return nil
 			}
-			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.URL.Path)
+			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.Method, proxyReq.URL.Path)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
@@ -419,9 +465,29 @@ func (e *proxyResponseError) Error() string {
 	return e.message
 }
 
-func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestPath string) error {
+func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestMethod, requestPath string) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
+	route, _ := matchPathRoute(requestMethod, requestPath)
+	if route.owner == ownerNewBuild {
+		if err := s.recordAssignment(recordCtx, route.id, node, "template_build"); err != nil {
+			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
+		}
+		return nil
+	}
+	if route.owner == ownerNewBuildConfirmed {
+		buildID := strings.TrimSpace(resp.Header.Get("x-agentenv-build-id"))
+		if buildID == "" {
+			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream build response is missing its build ID"}
+		}
+		if buildID != route.id {
+			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream build response ID does not match the request"}
+		}
+		if err := s.recordAssignment(recordCtx, buildID, node, "template_build"); err != nil {
+			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
+		}
+		return nil
+	}
 
 	if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
 		s.recordAssignment(recordCtx, sandboxID, node, "response_header")
@@ -457,7 +523,7 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 
 	ids := extractSandboxIDsFromResponse(body)
-	if isForkPath(requestPath) {
+	if route.owner == ownerSandboxFork {
 		ids = extractForkSandboxIDsFromResponse(body)
 	}
 	for _, sandboxID := range ids {
@@ -466,13 +532,13 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	return nil
 }
 
-func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, source string) {
+func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, source string) error {
 	rpcStart := time.Now()
 	_, err := s.scheduler.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{SandboxId: sandboxID, Node: node})
 	recordGatewaySchedulerRPC("RecordAssignment", rpcStart, err)
 	if err != nil {
 		s.logger.Warn("record assignment failed", zap.Error(err), zap.String("sandbox_id", sandboxID), zap.String("node_id", node.GetNodeId()))
-		return
+		return err
 	}
 
 	s.logger.Debug("gateway recorded sandbox assignment",
@@ -480,6 +546,7 @@ func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *s
 		zap.String("node_id", node.GetNodeId()),
 		zap.String("source", source),
 	)
+	return nil
 }
 
 func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {
@@ -515,24 +582,23 @@ func flushInterval(flushImmediately bool) time.Duration {
 }
 
 func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
+	route, _ := matchPathRoute(r.Method, r.URL.Path)
+	if route.allocatesBuild() {
+		return true
+	}
 	if r.Method != http.MethodPost {
 		return false
 	}
 	path := strings.TrimRight(r.URL.Path, "/")
 	if !hasSandbox {
-		return path == "/sandboxes" || path == "/sandboxes-cold"
+		return path == "/sandboxes" || path == "/v2/sandboxes" || path == "/sandboxes-cold"
 	}
 	if routeSource != routeSourcePath {
 		return false
 	}
 
 	// Fork is routed by the source sandbox but creates child sandbox assignments.
-	return isForkPath(path)
-}
-
-func isForkPath(path string) bool {
-	parts := strings.Split(strings.Trim(strings.TrimRight(path, "/"), "/"), "/")
-	return len(parts) == 3 && parts[0] == "sandboxes" && strings.TrimSpace(parts[1]) != "" && parts[2] == "fork"
+	return route.owner == ownerSandboxFork
 }
 
 func sandboxIDFromHeaders(h http.Header) (string, bool) {
@@ -573,54 +639,6 @@ func targetPortFromHeaders(h http.Header) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func sandboxIDFromPath(path string) (string, bool) {
-	const marker = "/sandboxes/"
-	rest, found := strings.CutPrefix(path, marker)
-	if !found {
-		_, rest, found = strings.Cut(path, marker)
-	}
-	if !found {
-		return "", false
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return "", false
-	}
-	if id, _, hasSlash := strings.Cut(rest, "/"); hasSlash {
-		rest = id
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return "", false
-	}
-	return rest, true
-}
-
-func isSandboxControlPlaneRequest(r *http.Request) bool {
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) < 2 || parts[0] != "sandboxes" || strings.TrimSpace(parts[1]) == "" {
-		return false
-	}
-
-	if len(parts) == 2 {
-		return r.Method == http.MethodGet || r.Method == http.MethodDelete
-	}
-	if len(parts) != 3 {
-		return false
-	}
-
-	switch parts[2] {
-	case "pause", "resume", "fork", "connect", "timeout", "refreshes", "snapshots":
-		return r.Method == http.MethodPost
-	case "network":
-		return r.Method == http.MethodPut
-	case "custom-extension-params":
-		return r.Method == http.MethodGet || r.Method == http.MethodPatch
-	default:
-		return false
-	}
 }
 
 func (s *Server) logHostRoutingHeaderConflicts(r *http.Request, route *hostRoute) {
@@ -899,7 +917,8 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 		return false
 	}
 
-	return !isSandboxControlPlaneRequest(r) && hasCompleteProxyRouteHeaders(r.Header)
+	_, pathRouted := matchPathRoute(r.Method, r.URL.Path)
+	return !pathRouted && hasCompleteProxyRouteHeaders(r.Header)
 }
 
 func isExplicitProxyPath(path string) bool {

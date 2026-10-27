@@ -19,6 +19,13 @@ use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
 
 const MAX_REPORT_BACKOFF: Duration = Duration::from_secs(60);
 const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds the TCP connect of a reconnect, which `GRPC_CALL_TIMEOUT` does not:
+/// the `grpc-timeout` deadline it sets is started by the channel when the call
+/// reaches it, and a call only reaches it once a connection is up. A SYN that
+/// is never answered is therefore left to the kernel's own retry limit, over
+/// two minutes at the default `tcp_syn_retries`, and a node refreshes every one
+/// of its sandbox bindings through this channel.
+const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returned by [`ObservabilityReporter::send_heartbeat`] when the scheduler
 /// rejects the heartbeat because this node's ID is not in its configured node
@@ -142,8 +149,12 @@ impl ObservabilityReporter {
                         backoff = cmp::min(backoff.saturating_mul(2), MAX_REPORT_BACKOFF);
                     }
                     Err(err) => {
+                        // `{:#}` walks the context chain. Plain `Display` prints only the
+                        // outermost context, which names the step that failed but never
+                        // why: a failed RPC reads the same whether it was refused, timed
+                        // out, or never reached a connection at all.
                         warn!(
-                            error = %err,
+                            error = %format_args!("{err:#}"),
                             retry_after_secs = backoff.as_secs(),
                             "observability heartbeat failed"
                         );
@@ -173,7 +184,10 @@ impl ObservabilityReporter {
                             &event_scheduler_channel,
                             events,
                         ).await {
-                            warn!(error = %err, "observability sandbox event batch report failed");
+                            warn!(
+                                error = %format_args!("{err:#}"),
+                                "observability sandbox event batch report failed"
+                            );
                         }
                     }
                 }
@@ -232,7 +246,7 @@ impl ObservabilityReporter {
                         node_id = %self.service.node_id(),
                         service_instance_id = %self.service.service_instance_id(),
                         attempt,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "failed to unregister node from scheduler during shutdown"
                     );
                     sleep(Duration::from_millis(200 * attempt)).await;
@@ -246,7 +260,8 @@ impl ObservabilityReporter {
     fn build_scheduler_channel(scheduler_endpoint: &str) -> Result<Channel> {
         let raw_endpoint = scheduler_endpoint.to_string();
         let endpoint = Endpoint::from_shared(raw_endpoint.clone())
-            .with_context(|| format!("invalid scheduler endpoint: {raw_endpoint}"))?;
+            .with_context(|| format!("invalid scheduler endpoint: {raw_endpoint}"))?
+            .connect_timeout(GRPC_CONNECT_TIMEOUT);
         Ok(endpoint.connect_lazy())
     }
 

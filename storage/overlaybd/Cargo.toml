@@ -28,7 +28,7 @@ zstd = "0.13.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 chrono = { version = "0.4", features = ["serde"] }
-sha2 = "0.10.9"
+sha2 = { version = "0.10.9", features = ["asm"] }
 tracing = "0.1.41"
 metrics = "0.24"
 dashmap = "6.1.0"
@@ -55,6 +55,10 @@ metrics-util = { version = "0.20.4", default-features = false, features = ["debu
 
 [[example]]
 name = "generate_image_config"
+required-features = ["full"]
+
+[[example]]
+name = "pack_plan_stats"
 required-features = ["full"]
 
 [[bench]]

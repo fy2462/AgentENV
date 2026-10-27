@@ -1,3 +1,4 @@
+pub(crate) mod buildkit;
 pub mod files;
 pub mod sandboxes;
 pub mod snapshots;
@@ -13,11 +14,16 @@ use ureq::Agent;
 #[derive(Clone)]
 pub struct Client {
     agent: Agent,
+    async_agent: reqwest::Client,
     base: String,
     api_key: String,
 }
 
 impl Client {
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     pub fn from_env() -> Result<Self> {
         let creds = Credentials::load()?;
         Self::new(&creds.url, &creds.api_key)
@@ -45,6 +51,10 @@ impl Client {
             .build();
         Ok(Self {
             agent,
+            async_agent: reqwest::Client::builder()
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
+                .build()?,
             base,
             api_key: api_key.to_string(),
         })

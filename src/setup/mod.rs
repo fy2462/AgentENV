@@ -1,7 +1,5 @@
-mod deps;
 mod kvm;
 mod network_capacity;
-pub mod overlaybd;
 mod packages;
 mod ublk;
 
@@ -17,7 +15,7 @@ use crate::cfg::AppConfig;
 pub async fn ensure_dependencies(config: &AppConfig) -> Result<()> {
     let deps_path = config.deps_path.clone();
     info!(path = %deps_path.display(), "ensuring dependencies");
-    deps::ensure(config, &deps_path).await
+    crate::deps::ensure(config, &deps_path).await
 }
 
 /// Provision host runtime packages and downloaded runtime assets without
@@ -25,7 +23,9 @@ pub async fn ensure_dependencies(config: &AppConfig) -> Result<()> {
 pub async fn ensure_provisioning(config: &AppConfig) -> Result<()> {
     packages::ensure()?;
     ensure_dependencies(config).await?;
-    deps::write_generated_overlaybd_global_configs(config, None)
+    crate::deps::write_generated_overlaybd_global_configs(config, None)?;
+    crate::sandbox::resolve_tools_image(config, config.resolved_tools_version()).await?;
+    Ok(())
 }
 
 /// Provision machine-wide prerequisites for the configured runtime account.
@@ -51,7 +51,7 @@ pub fn ensure_host(config: &AppConfig, runtime_user: &str, runtime_group: &str) 
         );
     }
     ublk::provision(runtime_group)?;
-    overlaybd::install_system_default_config(&config.deps_path, runtime_gid)?;
+    crate::deps::overlaybd_tools::install_system_default_config(&config.deps_path, runtime_gid)?;
     network_capacity::install_persistent_config().context("install /etc/sysctl.d/99-aenv.conf")?;
     fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").context("enable host IPv4 forwarding")?;
     network_capacity::check_and_adjust();
@@ -97,7 +97,7 @@ fn is_valid_runtime_account_name(name: &str) -> bool {
 /// Steps:
 /// 1. Verify the configured KVM/PVM host mode and `/dev/kvm` access
 /// 2. Ensure ublk kernel module is loaded and permissions are set
-/// 3. Download dependencies (firecracker, kernel, tools drive, overlaybd) if missing
+/// 3. Provision firecracker, kernel, local tools overrides, and OverlayBD
 pub async fn ensure_environment(
     config: &AppConfig,
     p2p_facade_address: Option<&str>,
@@ -126,7 +126,7 @@ pub async fn ensure_environment(
 
     // 4. Download dependencies and generate overlaybd runtime configs.
     ensure_dependencies(config).await?;
-    deps::write_generated_overlaybd_global_configs(config, p2p_facade_address)?;
+    crate::deps::write_generated_overlaybd_global_configs(config, p2p_facade_address)?;
 
     // 5. set nofile limit to a relative large value
     let (soft_limit, hard_limit) = getrlimit(Resource::RLIMIT_NOFILE).context("get rlimit")?;

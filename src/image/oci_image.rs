@@ -30,19 +30,23 @@
 //! reaching this module.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use overlaybd::tools::{ConvertLayerRequest, OverlaybdTools};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::{Builder, Uuid};
 
+use super::buildkit::{BuildkitContent, MAX_IMAGE_BYTES};
 use super::commit_index::sanitize_filename_component;
 use super::local_layer::LocalLayer;
 use super::{
@@ -50,6 +54,166 @@ use super::{
 };
 use crate::digest;
 use crate::p2p::P2pArtifactKey;
+
+/// Intentionally does not implement Debug: variants contain secrets.
+#[derive(Clone)]
+pub(crate) enum RegistryAuth {
+    General {
+        username: String,
+        password: String,
+    },
+    Gcp {
+        service_account_json: String,
+    },
+    Aws {
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+    },
+}
+
+impl RegistryAuth {
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::General { username, password } => {
+                ensure!(
+                    !username.is_empty() && !password.is_empty(),
+                    "registry username and password must be non-empty"
+                );
+            }
+            Self::Gcp {
+                service_account_json,
+            } => {
+                let key = serde_json::from_str::<serde_json::Value>(service_account_json)
+                    .ok()
+                    .filter(|value| value.is_object());
+                ensure!(key.is_some(), "serviceAccountJson must be a JSON object");
+            }
+            Self::Aws {
+                access_key_id,
+                secret_access_key,
+                region,
+            } => {
+                ensure!(
+                    !access_key_id.is_empty() && !secret_access_key.is_empty(),
+                    "AWS access keys must be non-empty"
+                );
+                ensure!(
+                    !region.is_empty()
+                        && region
+                            .bytes()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
+                    "invalid AWS region"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn config(&self, host: &str) -> Result<RegistryConfig> {
+        let (username, password) = match self {
+            Self::General { username, password } => (username.clone(), password.clone()),
+            Self::Gcp {
+                service_account_json,
+            } => ("_json_key".into(), service_account_json.clone()),
+            Self::Aws {
+                access_key_id,
+                secret_access_key,
+                region,
+            } => ecr_credentials(access_key_id, secret_access_key, region).await?,
+        };
+        RegistryConfig::new(host, &username, &password)
+    }
+}
+
+pub(crate) struct RegistryConfig(tempfile::NamedTempFile);
+
+impl RegistryConfig {
+    fn new(host: &str, username: &str, password: &str) -> Result<Self> {
+        let mut file = tempfile::Builder::new()
+            .prefix("aenv-registry-")
+            .tempfile()?;
+        serde_json::to_writer(
+            &mut file,
+            &json!({
+                "version": 1,
+                "incDockerCred": false,
+                "hosts": {host: {"user": username, "pass": password}}
+            }),
+        )?;
+        file.flush()?;
+        Ok(Self(file))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+async fn ecr_credentials(
+    access_key_id: &str,
+    secret_access_key: &str,
+    region: &str,
+) -> Result<(String, String)> {
+    let suffix = if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    };
+    let endpoint = format!("https://api.ecr.{region}.{suffix}/");
+    let mut request = http::Request::post(&endpoint)
+        .header("content-type", "application/x-amz-json-1.1")
+        .header(
+            "x-amz-target",
+            "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken",
+        )
+        .header(
+            "x-amz-content-sha256",
+            crate::digest::sha256_digest(b"{}").trim_start_matches("sha256:"),
+        )
+        .body(())?;
+    reqsign::AwsV4Signer::new("ecr", region)
+        .sign(
+            &mut request,
+            &reqsign::AwsCredential {
+                access_key_id: access_key_id.into(),
+                secret_access_key: secret_access_key.into(),
+                ..Default::default()
+            },
+        )
+        .context("sign ECR authorization request")?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(endpoint)
+        .headers(request.into_parts().0.headers)
+        .body("{}")
+        .send()
+        .await
+        .context("request ECR authorization token")?;
+    ensure!(
+        response.status().is_success(),
+        "ECR authorization request failed with HTTP {}",
+        response.status()
+    );
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .context("decode ECR authorization response")?;
+    let token = value["authorizationData"][0]["authorizationToken"]
+        .as_str()
+        .context("ECR returned no authorization token")?;
+    let decoded = STANDARD
+        .decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .context("invalid ECR authorization token")?;
+    let (username, password) = decoded
+        .split_once(':')
+        .context("invalid ECR authorization token format")?;
+    Ok((username.into(), password.into()))
+}
 
 /// GOMAXPROCS ceiling applied to every spawned `regctl` process; see
 /// [`regctl_command`] for the rationale.
@@ -61,7 +225,7 @@ const MAX_INDEX_RESOLUTION_DEPTH: usize = 4;
 /// Virtual block-device size baked into every converted overlaybd layer. The
 /// VM sees this as the rootfs device capacity; actual storage is only what the
 /// layers contain. 64 GiB comfortably covers common base images.
-const LAYER_VIRTUAL_SIZE_GIB: u64 = 64;
+pub(super) const LAYER_VIRTUAL_SIZE_GIB: u64 = 64;
 const OCI_INDEX_MEDIA_TYPES: &[&str] = &[
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -107,6 +271,7 @@ pub(crate) struct OverlaybdConversionEnv<'a> {
     pub(crate) global_config: &'a Path,
     pub(crate) converter_id: &'a str,
     pub(crate) regctl_binary: &'a Path,
+    pub(crate) registry_config: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,11 +350,12 @@ pub(crate) async fn fetch_oci_manifest(
     regctl_binary: &Path,
     image_ref: &str,
     host_arch: &str,
+    registry_config: Option<&Path>,
 ) -> ImageResult<FetchedManifest> {
     ensure_regctl_binary(regctl_binary)?;
     let oci_arch = host_arch_to_oci(host_arch)?;
 
-    fetch_manifest(regctl_binary, image_ref, oci_arch, "linux").await
+    fetch_manifest(regctl_binary, image_ref, oci_arch, "linux", registry_config).await
 }
 
 /// Fetch the image config blob by `config_digest` and parse runtime metadata
@@ -198,11 +364,13 @@ pub(crate) async fn fetch_oci_image_config_metadata(
     regctl_binary: &Path,
     image_ref: &str,
     config_digest: &str,
+    registry_config: Option<&Path>,
 ) -> ImageResult<ImageResolutionMetadata> {
     let repository = image_ref_repository(image_ref)?;
     let output = run_regctl(
         regctl_binary,
         &["blob", "get", repository.as_str(), config_digest],
+        registry_config,
     )
     .await?;
     let bytes = output.stdout;
@@ -390,7 +558,13 @@ async fn convert_standard_oci_layers_pipeline(
     converter: &OverlaybdLayerConverter,
 ) -> Result<Vec<LocalLayer>> {
     let layout_dir = work_root.join("oci");
-    let mut producer = RegctlImageCopyProducer::start(regctl_binary, image_ref, layout_dir).await?;
+    let mut producer = RegctlImageCopyProducer::start(
+        regctl_binary,
+        image_ref,
+        layout_dir,
+        conversion.registry_config,
+    )
+    .await?;
     let result = convert_standard_oci_layers_pipeline_inner(
         manifest,
         image_ref,
@@ -430,7 +604,7 @@ async fn convert_standard_oci_layers_pipeline_inner(
     conversion: OverlaybdConversionEnv<'_>,
     sink: &mut dyn ImageConversion,
     converter: &OverlaybdLayerConverter,
-    producer: &mut RegctlImageCopyProducer,
+    producer: &mut dyn LayerBlobSource,
 ) -> Result<Vec<LocalLayer>> {
     let mut lower_paths: Vec<PathBuf> = Vec::with_capacity(manifest.layers.len());
     let mut lowers = Vec::with_capacity(manifest.layers.len());
@@ -485,6 +659,7 @@ async fn convert_standard_oci_layers_pipeline_inner(
 
 struct RegctlImageCopyProducer {
     regctl_binary: PathBuf,
+    registry_config: Option<PathBuf>,
     image_ref: String,
     layout_dir: PathBuf,
     child: Option<tokio::process::Child>,
@@ -496,15 +671,134 @@ struct RegctlImageCopyProducer {
     backoff: Duration,
 }
 
+#[async_trait]
+trait LayerBlobSource: Send {
+    async fn wait_layer_blob(
+        &mut self,
+        idx: usize,
+        layer: &OciLayerDescriptor,
+    ) -> ImageResult<PathBuf>;
+}
+
+struct ContentLayerSource<'a> {
+    content: &'a BuildkitContent,
+    work: &'a Path,
+}
+
+#[async_trait]
+impl LayerBlobSource for ContentLayerSource<'_> {
+    async fn wait_layer_blob(
+        &mut self,
+        idx: usize,
+        layer: &OciLayerDescriptor,
+    ) -> ImageResult<PathBuf> {
+        let path = self.work.join(format!("blob-{idx}"));
+        self.content
+            .download(&layer.digest, layer.size, &path)
+            .await?;
+        Ok(path)
+    }
+}
+
+pub(super) async fn fetch_content_manifest(
+    content: &BuildkitContent,
+    digest: &str,
+    arch: &str,
+) -> Result<(FetchedManifest, ImageResolutionMetadata)> {
+    let arch = host_arch_to_oci(arch)?;
+    let mut digest = digest.to_owned();
+    for _ in 0..MAX_INDEX_RESOLUTION_DEPTH {
+        let bytes = content.metadata(&digest).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("manifests").is_some() {
+            let index: OciIndex = serde_json::from_value(value)?;
+            digest = select_manifest_for_platform(&index.manifests, arch, "linux")?
+                .digest
+                .clone();
+            continue;
+        }
+        anyhow::ensure!(
+            value.get("schemaVersion").and_then(|v| v.as_u64()) == Some(2),
+            "expected OCI schema version 2"
+        );
+        let manifest: OciManifest = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            classify_manifest(&manifest)? == ImageFormat::StandardOci,
+            "builder must export standard OCI layers"
+        );
+        anyhow::ensure!(manifest.layers.len() <= 1024, "image exceeds 1024 layers");
+        let size = manifest
+            .layers
+            .iter()
+            .try_fold(0u64, |total, layer| total.checked_add(layer.size));
+        anyhow::ensure!(
+            size.is_some_and(|size| size <= MAX_IMAGE_BYTES),
+            "image exceeds 64 GiB of compressed layers"
+        );
+        for layer in &manifest.layers {
+            super::buildkit::validate_digest(&layer.digest)?;
+        }
+        let config = content.metadata(&manifest.config.digest).await?;
+        let config_value: serde_json::Value = serde_json::from_slice(&config)?;
+        anyhow::ensure!(
+            config_value["os"] == "linux" && config_value["architecture"] == arch,
+            "built image must target linux/{arch}"
+        );
+        let metadata = parse_oci_image_config(std::str::from_utf8(&config)?)?;
+        return Ok((
+            FetchedManifest {
+                manifest_digest: digest.clone(),
+                selected_image_ref: digest,
+                repository_scope: None,
+                format: ImageFormat::StandardOci,
+                manifest,
+            },
+            metadata,
+        ));
+    }
+    bail!("builder image index nesting exceeds {MAX_INDEX_RESOLUTION_DEPTH}")
+}
+
+pub(super) async fn convert_content_image(
+    content: &BuildkitContent,
+    fetched: &FetchedManifest,
+    conversion: OverlaybdConversionEnv<'_>,
+    sink: &mut dyn ImageConversion,
+) -> Result<ResolvedImage> {
+    let work = sink.create_temp_staging_dir()?;
+    let converter = OverlaybdLayerConverter {
+        tools: OverlaybdTools::from_overlaybd_install_root(conversion.install_root),
+        global_config_path: conversion.global_config.to_path_buf(),
+        virtual_size_gib: LAYER_VIRTUAL_SIZE_GIB,
+    };
+    let mut producer = ContentLayerSource {
+        content,
+        work: work.path(),
+    };
+    let layers = convert_standard_oci_layers_pipeline_inner(
+        &fetched.manifest,
+        &fetched.manifest_digest,
+        work.path(),
+        conversion,
+        sink,
+        &converter,
+        &mut producer,
+    )
+    .await?;
+    Ok(ResolvedImage::Local(layers))
+}
+
 impl RegctlImageCopyProducer {
     async fn start(
         regctl_binary: &Path,
         image_ref: &str,
         layout_dir: PathBuf,
+        registry_config: Option<&Path>,
     ) -> ImageResult<Self> {
         ensure_regctl_binary(regctl_binary)?;
         let mut producer = Self {
             regctl_binary: regctl_binary.to_path_buf(),
+            registry_config: registry_config.map(Path::to_path_buf),
             image_ref: image_ref.to_string(),
             layout_dir,
             child: None,
@@ -524,7 +818,7 @@ impl RegctlImageCopyProducer {
         self.exit_status = None;
         self.stderr = None;
         let dest = format!("ocidir://{}:latest", self.layout_dir.display());
-        let mut command = regctl_command(&self.regctl_binary);
+        let mut command = regctl_command(&self.regctl_binary, self.registry_config.as_deref());
         command
             .args([
                 "image",
@@ -552,7 +846,10 @@ impl RegctlImageCopyProducer {
         self.attempts_started += 1;
         Ok(())
     }
+}
 
+#[async_trait]
+impl LayerBlobSource for RegctlImageCopyProducer {
     async fn wait_layer_blob(
         &mut self,
         idx: usize,
@@ -611,7 +908,9 @@ impl RegctlImageCopyProducer {
             tokio::time::sleep(OCI_LAYER_BLOB_POLL_INTERVAL).await;
         }
     }
+}
 
+impl RegctlImageCopyProducer {
     async fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
         if let Some(status) = self.exit_status {
             return Ok(Some(status));
@@ -740,12 +1039,14 @@ async fn fetch_manifest(
     image_ref: &str,
     arch: &str,
     os: &str,
+    registry_config: Option<&Path>,
 ) -> ImageResult<FetchedManifest> {
     let mut current_ref = image_ref.to_string();
     for _ in 0..MAX_INDEX_RESOLUTION_DEPTH {
         let output = run_regctl(
             regctl_binary,
             &["manifest", "get", "--format", "raw-body", &current_ref],
+            registry_config,
         )
         .await?;
         let raw = String::from_utf8(output.stdout).with_context(|| {
@@ -822,8 +1123,14 @@ pub(crate) fn regctl_stderr_is_not_found(stderr: &str) -> bool {
 ///
 /// All `regctl` invocations must be constructed through this so the cap is
 /// applied uniformly.
-pub(crate) fn regctl_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
+pub(crate) fn regctl_command(
+    binary: impl AsRef<std::ffi::OsStr>,
+    registry_config: Option<&Path>,
+) -> Command {
     let mut command = Command::new(binary);
+    if let Some(path) = registry_config {
+        command.env("REGCTL_CONFIG", path);
+    }
     command.env("GOMAXPROCS", REGCTL_GOMAXPROCS);
     command
 }
@@ -833,12 +1140,13 @@ pub(crate) fn regctl_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
 pub(crate) async fn run_regctl(
     regctl_binary: &Path,
     args: &[&str],
+    registry_config: Option<&Path>,
 ) -> ImageResult<std::process::Output> {
     ensure_regctl_binary(regctl_binary)?;
     let mut backoff = REGCTL_RETRY_BASE_DELAY;
     let mut last_stderr = String::new();
     for attempt in 1..=REGCTL_RETRY_ATTEMPTS {
-        let output = regctl_command(regctl_binary)
+        let output = regctl_command(regctl_binary, registry_config)
             .args(args)
             .output()
             .await
@@ -900,7 +1208,7 @@ fn verify_blob_digest(expected_digest: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn parse_oci_image_config(raw: &str) -> Result<ImageResolutionMetadata> {
+pub(super) fn parse_oci_image_config(raw: &str) -> Result<ImageResolutionMetadata> {
     let document: OciImageConfigDocument =
         serde_json::from_str(raw).context("parse OCI image config JSON")?;
     let config = document.config.unwrap_or_default();
@@ -1086,7 +1394,9 @@ impl std::fmt::Display for ImageFormat {
 
 fn classify_manifest(manifest: &OciManifest) -> ImageResult<ImageFormat> {
     if manifest.layers.is_empty() {
-        return Err(ImageError::Other(anyhow!("OCI manifest has no layers")));
+        return Err(ImageError::UnsupportedImage {
+            reason: "OCI manifest has no layers".to_string(),
+        });
     }
 
     let turbo_unsupported = |detail: String| ImageError::UnsupportedImage {
@@ -1324,7 +1634,7 @@ fn image_ref_repository(image_ref: &str) -> Result<String> {
 
 // ---- helpers ----
 
-fn host_arch_to_oci(host_arch: &str) -> Result<&'static str> {
+pub(super) fn host_arch_to_oci(host_arch: &str) -> Result<&'static str> {
     match host_arch {
         "x86_64" | "amd64" => Ok("amd64"),
         "aarch64" | "arm64" => Ok("arm64"),
@@ -1332,11 +1642,44 @@ fn host_arch_to_oci(host_arch: &str) -> Result<&'static str> {
     }
 }
 
+/// OCI algorithm grammar: alphanumeric components joined by single `.`/`_`/`+`/`-`
+/// separators. Rejecting anything else keeps the value free of path separators,
+/// `..`, and other traversal payloads.
+fn is_valid_digest_algorithm(algo: &str) -> bool {
+    !algo.is_empty()
+        && algo.split(['.', '_', '+', '-']).all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
 fn blob_path_for_digest(layout_dir: &Path, digest: &str) -> Result<PathBuf> {
     let (algo, hex) = digest
         .split_once(':')
         .with_context(|| format!("malformed OCI digest: {digest}"))?;
-    Ok(layout_dir.join("blobs").join(algo).join(hex))
+
+    // `algo` and `hex` are taken verbatim from the registry-served manifest and
+    // are otherwise unvalidated (see fetch_manifest). Without the checks below,
+    // `Path::join` turns a hostile digest into an arbitrary host path: an
+    // absolute component such as `/etc:passwd` replaces the base entirely, and
+    // `sha256:../../../../root/.ssh/id_rsa` traverses out of the layout
+    // (CWE-22, GHSA-hw7r-gmc9-84jv F3). Constrain both components to the OCI
+    // digest grammar and confirm the joined path stays inside the blob store.
+    if !is_valid_digest_algorithm(algo)
+        || hex.is_empty()
+        || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        bail!("refusing OCI digest with an unsafe algorithm or hex component: {digest}");
+    }
+
+    let blob_root = layout_dir.join("blobs");
+    let blob_path = blob_root.join(algo).join(hex);
+    if !blob_path.starts_with(&blob_root) {
+        bail!("OCI blob path for digest {digest} escapes the layout directory");
+    }
+    Ok(blob_path)
 }
 
 fn uuid_from_layer_digest(digest: &str) -> Uuid {
@@ -1397,6 +1740,63 @@ mod tests {
     use tempfile::tempdir;
     use uuid::{Variant, Version};
 
+    #[tokio::test]
+    async fn registry_auth_configs_are_isolated_private_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = RegistryAuth::General {
+            username: "one".into(),
+            password: "secret-one".into(),
+        };
+        let second = RegistryAuth::General {
+            username: "two".into(),
+            password: "secret-two".into(),
+        };
+        let (first, second) = tokio::join!(
+            first.config("registry.example"),
+            second.config("registry.example")
+        );
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_ne!(first.path(), second.path());
+        for (config, username, password) in [
+            (&first, "one", "secret-one"),
+            (&second, "two", "secret-two"),
+        ] {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(config.path()).unwrap()).unwrap();
+            assert_eq!(value["hosts"]["registry.example"]["user"], username);
+            assert_eq!(value["hosts"]["registry.example"]["pass"], password);
+            assert_eq!(value["hosts"].as_object().unwrap().len(), 1);
+            assert_eq!(value["incDockerCred"], false);
+            assert_eq!(
+                std::fs::metadata(config.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let path = first.path().to_path_buf();
+        drop(first);
+        assert!(!path.exists());
+        assert!(second.path().exists());
+    }
+
+    #[tokio::test]
+    async fn registry_auth_gcp_uses_json_key_credentials() {
+        let json = r#"{"type":"service_account","private_key":"test-only"}"#;
+        let config = RegistryAuth::Gcp {
+            service_account_json: json.into(),
+        }
+        .config("example.pkg.dev")
+        .await
+        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.path()).unwrap()).unwrap();
+        assert_eq!(value["hosts"]["example.pkg.dev"]["user"], "_json_key");
+        assert_eq!(value["hosts"]["example.pkg.dev"]["pass"], json);
+    }
+
     fn annotations(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries
             .iter()
@@ -1444,6 +1844,21 @@ mod tests {
     fn blob_path_for_digest_rejects_malformed_digest() {
         let layout = Path::new("/tmp/oci");
         assert!(blob_path_for_digest(layout, "no-colon-here").is_err());
+    }
+
+    #[test]
+    fn blob_path_for_digest_rejects_traversal_and_absolute_components() {
+        let layout = Path::new("/tmp/oci");
+        // Absolute algorithm component would replace the base via Path::join.
+        assert!(blob_path_for_digest(layout, "/etc:passwd").is_err());
+        // `..` / separators in the hex component.
+        assert!(blob_path_for_digest(layout, "sha256:../../../../root/.ssh/id_rsa").is_err());
+        assert!(blob_path_for_digest(layout, "sha256:ab/cd").is_err());
+        // Separators in the algorithm component.
+        assert!(blob_path_for_digest(layout, "sha256/..:abcd").is_err());
+        // A well-formed digest still resolves under the blob store.
+        let ok = blob_path_for_digest(layout, "sha256:0123456789abcdef").unwrap();
+        assert!(ok.starts_with("/tmp/oci/blobs"));
     }
 
     #[test]
@@ -1634,7 +2049,8 @@ mod tests {
     fn uuid_from_layer_digest_is_stable_and_digest_specific() {
         let digests = ["sha256:aaa", "sha256:aab", "sha256:aac", "sha256:aad"];
         let uuid = uuid_from_layer_digest(digests[0]);
-        assert_eq!(uuid, uuid_from_layer_digest(digests[0]));
+        // OCI tools v1 keeps this layer identity across runtime upgrades.
+        assert_eq!(uuid.to_string(), "6d4f1c33-bc1f-8f3d-89f7-46f7fecb5234");
         assert_ne!(
             uuid_from_layer_digest("sha256:aaa"),
             uuid_from_layer_digest("sha256:bbb")
@@ -1933,6 +2349,17 @@ mod tests {
     }
 
     #[test]
+    fn classify_manifest_rejects_manifest_without_layers() {
+        let manifest = OciManifest {
+            artifact_type: None,
+            config: manifest_config(),
+            layers: vec![],
+        };
+        let err = classify_manifest(&manifest).unwrap_err();
+        assert!(err.is_user_error(), "empty-layers image must map to 4xx");
+    }
+
+    #[test]
     fn classify_manifest_rejects_mixed_standard_and_overlaybd_layers() {
         let manifest = OciManifest {
             artifact_type: None,
@@ -2145,7 +2572,7 @@ mod tests {
         });
         let manifest_bytes = serde_json::to_vec(&manifest_json).unwrap();
         fs::create_dir_all(layout.join("blobs/sha256")).unwrap();
-        fs::write(layout.join("blobs/sha256/manifestA"), &manifest_bytes).unwrap();
+        fs::write(layout.join("blobs/sha256/aa01"), &manifest_bytes).unwrap();
 
         let index_json = serde_json::json!({
             "schemaVersion": 2,
@@ -2153,7 +2580,7 @@ mod tests {
             "manifests": [
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:manifestA",
+                    "digest": "sha256:aa01",
                     "size": manifest_bytes.len() as u64,
                 }
             ]
@@ -2195,8 +2622,8 @@ mod tests {
         });
         let amd_bytes = serde_json::to_vec(&amd_manifest).unwrap();
         let arm_bytes = serde_json::to_vec(&arm_manifest).unwrap();
-        fs::write(layout.join("blobs/sha256/amdManifest"), &amd_bytes).unwrap();
-        fs::write(layout.join("blobs/sha256/armManifest"), &arm_bytes).unwrap();
+        fs::write(layout.join("blobs/sha256/a0d64"), &amd_bytes).unwrap();
+        fs::write(layout.join("blobs/sha256/a2a64"), &arm_bytes).unwrap();
 
         let index_json = serde_json::json!({
             "schemaVersion": 2,
@@ -2204,13 +2631,13 @@ mod tests {
             "manifests": [
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:amdManifest",
+                    "digest": "sha256:a0d64",
                     "size": amd_bytes.len() as u64,
                     "platform": {"architecture": "amd64", "os": "linux"}
                 },
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:armManifest",
+                    "digest": "sha256:a2a64",
                     "size": arm_bytes.len() as u64,
                     "platform": {"architecture": "arm64", "os": "linux"}
                 }
@@ -2237,9 +2664,9 @@ mod tests {
 
         for level in 0..=MAX_INDEX_RESOLUTION_DEPTH {
             let next_digest = if level == MAX_INDEX_RESOLUTION_DEPTH {
-                "sha256:finalManifest".to_string()
+                "sha256:f1a1".to_string()
             } else {
-                format!("sha256:index{level}")
+                format!("sha256:1de{level:x}")
             };
             let media_type = if level == MAX_INDEX_RESOLUTION_DEPTH {
                 "application/vnd.oci.image.manifest.v1+json"
@@ -2257,14 +2684,14 @@ mod tests {
                 }]
             });
             fs::write(
-                layout.join(format!("blobs/sha256/index{level}")),
+                layout.join(format!("blobs/sha256/1de{level:x}")),
                 serde_json::to_vec(&nested).unwrap(),
             )
             .unwrap();
         }
 
         fs::write(
-            layout.join("blobs/sha256/finalManifest"),
+            layout.join("blobs/sha256/f1a1"),
             serde_json::to_vec(&serde_json::json!({
                 "schemaVersion": 2,
                 "config": {"digest": "sha256:config"},
@@ -2281,7 +2708,7 @@ mod tests {
                 "mediaType": "application/vnd.oci.image.index.v1+json",
                 "manifests": [{
                     "mediaType": "application/vnd.oci.image.index.v1+json",
-                    "digest": "sha256:index0",
+                    "digest": "sha256:1de0",
                     "size": 1,
                     "platform": {"architecture": "amd64", "os": "linux"}
                 }]

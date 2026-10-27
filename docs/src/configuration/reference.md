@@ -41,13 +41,13 @@ Firecracker VM binary and boot configuration.
 | `version` | string | manifest value | Optional Firecracker release override for auto-download |
 | `url` | string | manifest value | Optional download URL template override with `{version}` and `{arch}` placeholders |
 | `binary_path` | string | derived from manifest/config version | Explicit path to a local `firecracker` binary. Setup skips the Firecracker download and requires this to be a readable, non-empty, executable regular file |
-| `boot_args` | string | `"console=ttyS0 reboot=k panic=1 pci=off init=/init …"` | Kernel command line arguments. The shipped default also includes DAMON memory-reclaim parameters; see `config/default.toml` for the full value. |
+| `boot_args` | string | `"console=ttyS0 reboot=k panic=1 pci=off init=/init …"` | Complete kernel command line. The shipped default also includes DAMON memory-reclaim and free-page-reporting parameters; see `config/default.toml` for the full value. |
 | `allowed_extra_boot_args_prefixes` | array of strings | `[]` | Allowed prefixes for `extraBootArgs` on cold-start sandboxes. If empty, no request-provided extra boot args are appended |
 | `socket_timeout_secs` | integer | `3` | Max seconds to wait for the Firecracker API socket |
 | `socket_poll_ms` | integer | `1` | Poll interval (ms) for checking socket availability |
 | `work_dir` | string | `"$AENV_HOME/firecracker-work"` | Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as `overlaybd/upper.data` and `overlaybd/upper.index` |
-| `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker serial output (per-sandbox subdirectories) |
-| `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). When set to a non-empty value, Firecracker's own logging is enabled and written to a `firecracker.log` file in each sandbox's log directory (alongside the serial output). Empty/unset disables it |
+| `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging |
+| `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). A non-empty value enables `firecracker.log` and stdout/stderr capture in each sandbox's log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream |
 
 ## `[kernel]`
 
@@ -59,9 +59,21 @@ Linux kernel image for microVMs.
 | `url` | string | manifest value | Optional download URL template override with `{version}` placeholder |
 | `image_path` | string | derived from manifest/config version | Explicit path to a local `vmlinux.bin`. Setup skips the kernel download and requires this to be a readable, non-empty regular file |
 
+## `[overlaybd]`
+
+Optional override for the OverlayBD tools release that setup downloads. When the
+section is omitted, the release in `config/deps_manifest.toml` is used.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `version` | string | manifest value | OverlayBD tools release; required when the section is set |
+| `package_url` | string | manifest value | Download URL template for the tools archive, with `{version}` and `{arch}` placeholders |
+| `url` | string | unset | Fallback for `package_url` |
+
 ## `[tools]`
 
 Tools drive image used to boot the AgentENV control plane inside each microVM.
+The default release is selected automatically; most deployments can leave this section unchanged.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -70,11 +82,22 @@ Tools drive image used to boot the AgentENV control plane inside each microVM.
 | `drive_path` | string | unset | Local tools ext4 source imported into the versioned dependency directory; requires an explicit `version` |
 | `control_plane_port` | integer | `49983` | Port used by envd inside the guest |
 
-Snapshots and paused sandboxes keep using the tools drive version they were
-created with. Launch does not download missing releases: operators must install
-the recorded version under `<deps_path>/tools/<version>/tools.ext4` before
-restore. Setup retains previously installed versions until they are removed
-manually.
+Snapshots and paused sandboxes record only `tools_drive_version`. Launch and
+restore fetch that version from the configured URL template when it is missing
+locally. Releases must be immutable and retained for the lifetime of their
+snapshots; changing the default version affects new sandboxes and templates.
+
+OCI tools rootfs images carry `io.agentenv.tools-drive.format=oci-rootfs-v1`
+(the tools Dockerfile adds it automatically). They are downloaded and converted
+locally with a stable, pinned conversion contract. Converted layers live in the
+versioned dependency directory, independently of image-cache eviction. Explicit
+`--setup-only` prepares the default release for dependency bundles.
+
+Native OverlayBD images keep lazy reads and automatically download tools layers
+in the background after envd is ready, independently of memory and user disks.
+Legacy images without the format label provide `tools.ext4`, which is downloaded
+and mounted read-only. Tools are not uploaded into snapshot storage. A local
+`drive_path` only identifies its declared version.
 
 ## Template Rootfs Images
 
@@ -92,6 +115,7 @@ User-visible rootfs images are selected at the template API layer.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `default_image` | string | `ubuntu:24.04` | Image used when template builds omit `fromImage` |
+| `convert_standard_oci` | boolean | `true` | Convert standard OCI tar layers into local OverlayBD commits. Set `false` to require OverlayBD-native images or referrers and fail fast otherwise |
 | `search_registries` | array of strings | `["docker.io", "ghcr.io"]` | Registries tried when resolving short image references |
 | `allowed_registries` | array of strings | unset (no restriction) | Whitelist of registry hosts (e.g. `docker.io`, `registry.example.com:5000`). **Omitting the key** imposes no restriction; an **explicit empty list `[]`** denies every registry. When set to a non-empty list, only references whose registry host is in the list resolve; any other host is rejected as a client (4xx, `ImageReferenceError`) error. See *How the three registry settings interact* below. |
 | `try_referrers_overlaybd_prefixes` | array of strings | `[]` | Image reference prefixes for which AgentENV tries OCI Referrers API via `regctl` for an overlaybd-native artifact before converting a standard OCI image locally. Prefixes are matched with simple `starts_with`; include the trailing slash yourself, for example `registry.example.com/` or `registry.example.com/team/`. Requires `regctl` on `PATH`; lookup failures fall back to the source image. |
@@ -152,7 +176,7 @@ Background hard-commit garbage collection for the image cache. When enabled,
 each pass reconciles metadata from the on-disk source configs and then deletes
 hard-commit objects that are no longer rooted by source configs, held by
 image-cache leases, or referenced by the in-process running set. Committed
-snapshots are durable SnapshotRepository state and do not pin ImageCache
+snapshots are durable repository state and do not pin ImageCache
 commits. With `capacity_gb` set, GC first evicts least-recently-used source
 configs over the high watermark so hard-commit GC can reclaim what they unrooted.
 
@@ -176,6 +200,7 @@ Overlaybd registryfs_v2 remote block cache settings. The directory is always
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_size_gb` | integer | `100` | Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd `cacheConfig.cacheSizeGB` |
+| `open_evict_idle_secs` | integer | `600` | Idle age in seconds after which a cache entry held open by a running sandbox may have its cached blocks reclaimed under capacity pressure. The entry is kept and refills on demand; `0` disables open-entry eviction. Written to generated overlaybd `cacheConfig.openEvictIdleSecs` and applies to both `remote-blocks` and `memory-blocks` caches |
 
 Resolved image data is cached under:
 
@@ -241,6 +266,18 @@ Default VM resources for sandboxes.
 | `mem_size_mib` | integer | `1024` | Guest RAM in MiB |
 | `vcpu_count` | integer | `2` | Number of virtual CPUs |
 
+## `[machine.disk_rate_limit]`
+
+Per-sandbox disk I/O limits, applied through Firecracker's virtio-blk rate limiter.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable per-sandbox disk I/O rate limiting |
+| `bandwidth_bytes_per_sec` | integer | `0` | Sustained disk bandwidth limit in bytes per second; `0` means unlimited |
+| `bandwidth_burst_bytes` | integer | `0` | One-time bandwidth burst in bytes, granted once when the VM starts (Firecracker's `one_time_burst`). It is consumed before the sustained bucket and never replenished, so it only absorbs the initial I/O spike. Requires `bandwidth_bytes_per_sec` |
+| `iops` | integer | `0` | Sustained IOPS limit; `0` means unlimited |
+| `iops_burst` | integer | `0` | One-time IOPS burst, granted once when the VM starts. Consumed before the sustained bucket and never replenished. Requires `iops` |
+
 ## `[envd]`
 
 In-guest `envd` daemon settings.
@@ -277,6 +314,8 @@ Sandbox lifecycle management.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `auto_evict_interval_ms` | integer | `1000` | Poll interval (ms) for background timeout eviction |
+| `metrics_interval_secs` | integer | `15` | Guest metrics scan interval; 0 disables collection |
+| `metrics_retention_secs` | integer | `3600` | Node-local in-memory guest sample retention (seconds) |
 | `default_sandbox_timeout_secs` | integer | `15` | Default keep-alive timeout for sandboxes |
 | `auto_resume_min_sandbox_timeout_secs` | integer | `300` | When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration |
 | `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Directory for persisted sandbox state |
@@ -294,8 +333,11 @@ Component sections:
 
 | Section | Key | Type | Default | Description |
 |---------|-----|------|---------|-------------|
+| `[pool.network]` | `enabled` | boolean | `true` | When `false`, disables the network-slot maintenance worker; slots are still created on demand |
 | `[pool.network]` | `maintenance_enabled` | boolean | `true` | Enable the background network-slot maintenance worker |
+| `[pool.network]` | `startup_prewarm` | boolean | `true` | Accepted but currently unused |
 | `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool |
+| `[pool.block]` | `maintenance_enabled` | boolean | `true` | Ignored: the block pool always refills at request time, because the reusable device shape depends on the image and size |
 | `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
@@ -374,7 +416,7 @@ snapshot publication/runtime resolution as an optional acceleration path.
 
 ## `[custom_extension]`
 
-Custom extension service configuration. When `url` is unset, the integration is fully disabled. See [Custom Extension](../concepts/custom-extension.md).
+Custom extension service configuration. When `url` is unset, the integration is fully disabled. See [Custom Extension](../concepts/custom-extension/index.md).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -424,6 +466,44 @@ them. Snapshot P2P publication also skips digest-keyed advertisements for
 local raw layers whose digest is absent from the committed record — the
 record names the compressed bytes, so the raw digest key would never be
 looked up by consumers.
+
+
+## `[snapshot.memory_startup_pack]`
+
+Optional startup-memory trace recording and best-effort prefetch for both
+`oss` and `posix_fs` repositories. It is disabled by default. Publishing never
+waits for recording: a completed trace is encoded as a SHA-256-verified
+manifest and attached to the already committed snapshot. Snapshots without a
+descriptor, with a missing/corrupt manifest, or with a failed prefetch always
+resume through the ordinary on-demand path.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Record a first-touch trace after capture and persist a manifest when recording succeeds. |
+| `record_min_window_ms` | integer | `200` | Minimum recorder observation window after its first read. |
+| `record_quiet_ms` | integer | `300` | Stop recording after this quiet interval. |
+| `record_max_window_ms` | integer | `2000` | Hard recorder observation-window cap. |
+| `record_budget_secs` | integer | `10` | Best-effort recording budget; it never blocks the snapshot publish. |
+| `max_pack_bytes` | integer | `1073741824` | Maximum recorded page-data budget and POSIX logical prefetch budget. |
+| `consume_enabled` | boolean | `false` | Enable resume-time prefetch; leave disabled for rollout and A/B comparisons. |
+| `consume_timeout_secs` | integer | `30` | Deadline for queueing and dispatching further prefetch reads; an in-kernel read may outlive it. |
+
+For POSIX, the resolver hands the normal sandbox start path a `LocalPath`
+manifest. After acquiring the actual shared memory ublk device, the executor
+reads its logical manifest ranges through a buffered device handle, concurrently
+with recovery. This warms the device page cache used by Firecracker, rather
+than the separate cache of lower-layer files. Each run uses one reader and a
+1 MiB buffer; at most four readers run process-wide. In-flight sharing includes
+the manifest digest and live device generation.
+
+Cancellation and the time budget stop dispatch of subsequent reads. An already
+executing kernel read cannot be interrupted. Stop and retry wait up to the sandbox
+socket timeout for prefetch cleanup; after that it continues in the background,
+retaining the device lease until the read finishes. `O_DIRECT`
+(`io_engine = 2`) remains explicitly skipped pending validation of that lower-I/O
+configuration with device prefetch; this is not a claim that device page cache
+is bypassed. The configured I/O engine is never changed. OSS retains its existing
+physical-range planner and executor. Prefetch is not a correctness dependency.
 
 ## `[backend.posix_fs]`
 
@@ -518,6 +598,7 @@ OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ig
 | `runtime_upper_mode` | string | `"hybridLogStructured"` | Runtime upper format for newly materialized writable rootfs OverlayBD images. Supported values are `"logStructured"`, `"hybridLogStructured"`, and `"sparse"`. Existing source uppers keep their own mode |
 | `allow_shrink` | boolean | `false` | Allows an explicit cold-start `diskSizeMB` smaller than the source rootfs. Explicit sizes use MiB and must be divisible by 1024. Growth is always allowed; snapshot resume never resizes. |
 | `resize_timeout_secs` | integer | `120` | Timeout in seconds for the cold-start OverlayBD resize tool. Must be greater than zero. |
+| `remote_io_workers` | integer | `4` | Worker threads of the overlaybd runtime's dedicated remote-I/O runtime (OSS and registry downloads), written as `remoteIoWorkers` into generated overlaybd global configs. Must be greater than zero. |
 | `download_enable` | boolean | `false` | Enables overlaybd layer-level background download for remote layers |
 | `p2p_lookup_timeout_ms` | integer | `300` | Timeout for one foreground Overlaybd descriptor lookup through the localhost P2P HTTP facade. Timeout is treated as a cacheable miss. |
 | `p2p_fetch_range_timeout_ms` | integer | `2000` | Timeout for one foreground Overlaybd range fetch through the localhost P2P HTTP facade before falling back to the origin registry. |
@@ -585,3 +666,20 @@ and are then re-fetched on demand.
 | `block_size` | integer | `16777216` | Background download chunk size in bytes (16 MiB): one source request fetches a chunk of this size, aligned down to whole cache blocks. The cache keeps its own smaller block size for foreground reads, so background downloads keep large-request throughput while foreground keeps fine-grained on-demand reads. Peak scratch per active layer download is `block_size × concurrency`. |
 | `concurrency` | integer | `4` | Maximum number of in-flight block remote reads within a single remote layer. `1` keeps the historical serial behavior. Must be greater than zero. |
 | `max_inflight_blocks` | integer | `16` | Cap on concurrently downloading chunks enforced by each file-cache backend's download scheduler, shared by every concurrent layer download on that backend; bounds total scratch memory to `max_inflight_blocks` × the download chunk size (`block_size`). The value is fixed when the backend is created from the global config; a per-image `download` override never resizes the scheduler-owned cap (the first mismatch per scheduler is logged as `max_inflight_blocks_override_ignored`). Must be greater than zero. |
+
+## `[template_build]`
+
+Managed Dockerfile builder resources. The first Dockerfile
+build on a node prepares a reusable internal builder template. Each build mounts
+a separate clone of the repository's shared cache seed; concurrent builds do not
+queue for cache ownership. The last successfully published cache becomes the next
+seed, with best-effort reuse of concurrent branches.
+Builder resources do not change the resulting template's CPU or memory.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_concurrent_builds` | integer | `4` | Per-node limit for managed builds, including preparation, publication, and cleanup. Must be greater than zero. Excess builder PUT requests return HTTP 429 and leave the build waiting for retry. |
+| `builder_image` | string | `"docker.io/moby/buildkit:v0.33.0"` | Image containing the managed BuildKit daemon, client, and OCI runtime. |
+| `builder_cpu_count` | integer | `16` | Builder vCPUs, from 1 to 255. |
+| `builder_memory_mb` | integer | `32768` | Builder memory in MiB, from 256 to 2147483647. |
+| `cache_size_mb` | integer | `65536` | Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most `volume.max_size_mb`; changing it does not resize existing caches. |

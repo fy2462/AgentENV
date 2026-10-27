@@ -37,6 +37,13 @@ const RECONNECT_PAUSE_JOIN_TIMEOUT: Duration = Duration::from_millis(450);
 const SEND_INPUT_TIMEOUT: Duration = Duration::from_millis(500);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SANDBOX_LOST_TIMEOUT: Duration = Duration::from_secs(10);
+const INTERACTIVE_SHELL_DISPATCHER: &str = concat!(
+    "if [ -x /bin/bash ] && /bin/bash -c 'exit 0' >/dev/null 2>&1; then ",
+    "exec /bin/bash; fi; ",
+    "if [ -x /bin/sh ] && /bin/sh -c 'exit 0' >/dev/null 2>&1; then ",
+    "exec /bin/sh; fi; ",
+    "exec /agentenv/bin/busybox sh"
+);
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -56,39 +63,21 @@ pub(crate) async fn attach(client: &Client, sandbox_id: &str) -> Result<i32> {
 
     let (cols, rows) = terminal_size();
     let transport = Arc::new(client.transport(sandbox_id, sandbox.envd_access_token.as_deref())?);
-    let mut last_error = None;
-    let mut started = None;
-    for shell in ["/bin/bash", "/bin/sh"] {
-        let req = build_start_request(StartOpts {
-            cmd: shell,
-            args: Vec::new(),
-            envs: pty_envs(),
-            pty: Some((cols, rows)),
-            stdin: true,
-        });
-        let mut stream = match transport
-            .server_stream::<_, StartResponse>("Start", req)
-            .await
-        {
-            Ok(stream) => stream,
-            Err(err) => {
-                last_error = Some(err);
-                continue;
-            }
-        };
-        match wait_for_pid(&mut stream).await {
-            Ok(pid) => {
-                started = Some((stream, pid));
-                break;
-            }
-            Err(err) => {
-                last_error = Some(err);
-            }
-        }
-    }
-    let (stream, pid) = started.ok_or_else(|| {
-        last_error.unwrap_or_else(|| anyhow::anyhow!("no shell candidates configured"))
-    })?;
+    let req = build_start_request(StartOpts {
+        cmd: "/agentenv/bin/busybox",
+        args: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            INTERACTIVE_SHELL_DISPATCHER.to_owned(),
+        ],
+        envs: pty_envs(),
+        pty: Some((cols, rows)),
+        stdin: true,
+    });
+    let mut stream = transport
+        .server_stream::<_, StartResponse>("Start", req)
+        .await?;
+    let pid = wait_for_pid(&mut stream).await?;
 
     let raw = RawModeGuard::enter()?;
     let selector = ProcessSelector {
@@ -331,7 +320,6 @@ async fn maintain_stream_input(
                             &transport,
                             selector.clone(),
                             payload,
-                            &mut stdin_rx,
                         ).await;
                     }
                     _ = tokio::time::sleep(INPUT_STATE_POLL_INTERVAL) => {}
@@ -374,7 +362,6 @@ async fn maintain_stream_input(
                             &transport,
                             selector.clone(),
                             payload,
-                            &mut stdin_rx,
                         ).await;
                         break;
                     }
@@ -406,20 +393,13 @@ fn should_expect_output(payload: &[u8]) -> bool {
         .any(|byte| matches!(*byte, 0x20..=0x7e) || *byte >= 0x80)
 }
 
-async fn send_recovery_input(
-    transport: &Transport,
-    selector: ProcessSelector,
-    payload: Vec<u8>,
-    stdin_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
-) {
+async fn send_recovery_input(transport: &Transport, selector: ProcessSelector, payload: Vec<u8>) {
     let req = send_input_request(selector, payload);
     let _ = tokio::time::timeout(
         SEND_INPUT_TIMEOUT,
         transport.unary::<_, envd::process::SendInputResponse>("SendInput", req),
     )
     .await;
-
-    while stdin_rx.try_recv().is_ok() {}
 }
 
 async fn route_input(
@@ -846,6 +826,9 @@ enum ProbeStatus {
     Healthy,
     Unhealthy,
 }
+
+#[cfg(test)]
+mod input_tests;
 
 #[cfg(test)]
 mod tests {

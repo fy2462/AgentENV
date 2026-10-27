@@ -13,18 +13,21 @@ use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
 use overlaybd::RestackSnapshotTerminalFailure;
+use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
 use storage_util::io_ring::IoRingHandle;
 use uvm_ublk::{
-    delete_dev, ublk_caps, wait_for_ublk_dev, OverlaybdTarget, UVMUblkCtrlBuilder, UVMUblkDev,
-    UVMUblkDevBuilder, UVMUblkTarget,
+    delete_dev, tmp_pack_path, ublk_caps, wait_for_ublk_dev, OverlaybdTarget, StartupPackRecorder,
+    UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder, UVMUblkTarget,
 };
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
+    ResizeToolSpec,
 };
 use crate::runtime;
 
@@ -33,6 +36,20 @@ use crate::runtime;
 struct ManagedDevice {
     dev: UVMUblkDev<OverlaybdTarget>,
     image: Arc<ImageFile>,
+}
+
+/// Tracks one startup pack recording attached to a device.
+struct PackRecordingHandle {
+    /// Final pack output path (the `memory-startup.pack` artifact).
+    output: PathBuf,
+    state: Arc<std::sync::Mutex<PackRecordingState>>,
+    task: tokio::task::JoinHandle<()>,
+    /// Set by abort/delete/shutdown; the packaging pass checks it before the
+    /// final rename so a cancelled pack never lands at `output`.
+    cancelled: Arc<AtomicBool>,
+    /// Held by the window task while packaging runs; abort cleanup acquires
+    /// it so file removal never races an in-flight finalize rename.
+    finalize_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 // ── Pooled device wrapper ───────────────────────────────────────────────────
@@ -250,6 +267,9 @@ impl PoolState {
 
 // ── Daemon server ───────────────────────────────────────────────────────────
 
+/// Maximum number of devices torn down at the same time during shutdown.
+const SHUTDOWN_STOP_CONCURRENCY: usize = 16;
+
 pub struct UblkDaemonServer {
     socket_path: PathBuf,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
@@ -263,6 +283,12 @@ pub struct UblkDaemonServer {
     /// all share the single isolated resize cacheDir, so only one may run at
     /// a time.
     resize_permit: Arc<Mutex<()>>,
+    pack_recordings: Arc<DashMap<u32, Arc<PackRecordingHandle>>>,
+    /// Keep-alive list for in-flight startup pack prefetch tasks. Entries
+    /// are pruned on each new prefetch; a live task is never dropped here,
+    /// so a shared memory device's release never cancels a prefetch other
+    /// sandboxes may still want.
+    startup_pack_handles: Arc<Mutex<Vec<overlaybd::backend::cache::StartupPackHandle>>>,
     shutdown: Arc<Notify>,
 }
 
@@ -311,6 +337,8 @@ impl UblkDaemonServer {
             resize_tool: None,
             resize_global_config,
             resize_permit: Arc::new(Mutex::new(())),
+            pack_recordings: Arc::new(DashMap::new()),
+            startup_pack_handles: Arc::new(Mutex::new(Vec::new())),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -396,6 +424,8 @@ impl UblkDaemonServer {
                     let resize_tool = self.resize_tool.clone();
                     let resize_global_config = self.resize_global_config.clone();
                     let resize_permit = Arc::clone(&self.resize_permit);
+                    let pack_recordings = Arc::clone(&self.pack_recordings);
+                    let startup_pack_handles = Arc::clone(&self.startup_pack_handles);
                     let shutdown = Arc::clone(&self.shutdown);
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
@@ -407,6 +437,8 @@ impl UblkDaemonServer {
                             resize_tool,
                             resize_global_config,
                             resize_permit,
+                            pack_recordings,
+                            startup_pack_handles,
                             shutdown,
                         ).await {
                             tracing::error!(?err, "daemon connection handler failed");
@@ -435,21 +467,43 @@ impl UblkDaemonServer {
     }
 
     async fn stop_all_devices(&self) {
+        // Abort pack recordings first so a window task cannot finalize into a
+        // device that is being stopped, and no tmp pack files survive.
+        let recording_ids: Vec<u32> = self.pack_recordings.iter().map(|r| *r.key()).collect();
+        for dev_id in recording_ids {
+            if let Some((_, handle)) = self.pack_recordings.remove(&dev_id) {
+                abort_pack_recording_handle(&handle).await;
+            }
+        }
+
+        // Each STOP_DEV/DEL_DEV waits for block-layer RCU grace periods, so
+        // deleting devices one by one makes shutdown time grow linearly with
+        // the device count. Overlap the waits with bounded concurrency.
+        let permits = Arc::new(Semaphore::new(SHUTDOWN_STOP_CONCURRENCY));
+        let mut stops = JoinSet::new();
+
         let dev_ids: Vec<u32> = self.devices.iter().map(|r| *r.key()).collect();
         for dev_id in dev_ids {
             if let Some((_, mut device)) = self.devices.remove(&dev_id) {
-                tracing::info!(dev_id, "stopping device during shutdown");
-                quiesce_managed_device(&mut device).await;
-                // ManagedDevice holds an open fd to the ublk char dev.
-                // Must drop it before delete_dev, or the DEL_DEV ioctl will block.
-                drop(device);
-                if let Err(err) = delete_dev(self.ctrl_ring.clone(), dev_id).await {
-                    tracing::warn!(dev_id, ?err, "failed to stop device during shutdown");
-                }
+                let ctrl_ring = self.ctrl_ring.clone();
+                let permits = Arc::clone(&permits);
+                stops.spawn(async move {
+                    let _permit = permits.acquire_owned().await;
+                    tracing::info!(dev_id, "stopping device during shutdown");
+                    quiesce_managed_device(&mut device).await;
+                    // ManagedDevice holds an open fd to the ublk char dev.
+                    // Must drop it before delete_dev, or the DEL_DEV ioctl will block.
+                    drop(device);
+                    if let Err(err) = delete_dev(ctrl_ring, dev_id).await {
+                        tracing::warn!(dev_id, ?err, "failed to stop device during shutdown");
+                    }
+                });
             }
         }
 
         if let Some(pool) = &self.pool_state {
+            let mut pooled_devs = Vec::new();
+
             let exclusive_ids: Vec<u32> = pool
                 .active_exclusive
                 .iter()
@@ -457,7 +511,7 @@ impl UblkDaemonServer {
                 .collect();
             for dev_id in exclusive_ids {
                 if let Some((_, active)) = pool.active_exclusive.remove(&dev_id) {
-                    stop_overlaybd_device(self.ctrl_ring.clone(), active.dev).await;
+                    pooled_devs.push(active.dev);
                 }
             }
 
@@ -469,13 +523,25 @@ impl UblkDaemonServer {
             for key in shared_keys {
                 if let Some((_, active)) = pool.active_shared.remove(&key) {
                     pool.shared_by_dev_id.remove(&active.dev.dev_id());
-                    stop_overlaybd_device(self.ctrl_ring.clone(), active.dev).await;
+                    pooled_devs.push(active.dev);
                 }
             }
 
-            let idle_devices: Vec<PooledDevice> = pool.idle.drain_all();
-            for pooled in idle_devices {
-                stop_overlaybd_device(self.ctrl_ring.clone(), pooled.dev).await;
+            pooled_devs.extend(pool.idle.drain_all().into_iter().map(|pooled| pooled.dev));
+
+            for dev in pooled_devs {
+                let ctrl_ring = self.ctrl_ring.clone();
+                let permits = Arc::clone(&permits);
+                stops.spawn(async move {
+                    let _permit = permits.acquire_owned().await;
+                    stop_overlaybd_device(ctrl_ring, dev).await;
+                });
+            }
+        }
+
+        while let Some(result) = stops.join_next().await {
+            if let Err(err) = result {
+                tracing::warn!(?err, "device stop task failed during shutdown");
             }
         }
     }
@@ -493,11 +559,14 @@ async fn handle_connection(
     resize_tool: Option<ResizeToolSpec>,
     resize_global_config: PathBuf,
     resize_permit: Arc<Mutex<()>>,
+    pack_recordings: Arc<DashMap<u32, Arc<PackRecordingHandle>>>,
+    startup_pack_handles: Arc<Mutex<Vec<overlaybd::backend::cache::StartupPackHandle>>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     let Some(request) = recv_message::<DaemonRequest>(&mut stream).await? else {
         return Ok(());
     };
+    let rollback_ring = ctrl_ring.clone();
 
     let response = match request {
         DaemonRequest::CreateOverlaybd {
@@ -545,7 +614,9 @@ async fn handle_connection(
             )
             .await
         }
-        DaemonRequest::Delete { dev_id } => handle_delete(&devices, ctrl_ring, dev_id).await,
+        DaemonRequest::Delete { dev_id } => {
+            handle_delete(&devices, ctrl_ring, &pack_recordings, dev_id).await
+        }
         DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path,
@@ -558,6 +629,58 @@ async fn handle_connection(
             );
             overlaybd::download_gate::notify_sandbox_ready(&device_key);
             Ok(DaemonResponse::Ok)
+        }
+        DaemonRequest::StartPackRecording {
+            dev_id,
+            output,
+            max_pages,
+            min_window_ms,
+            quiet_ms,
+            max_window_ms,
+        } => {
+            handle_start_pack_recording(
+                &devices,
+                &pack_recordings,
+                dev_id,
+                PackRecordingParams {
+                    output,
+                    max_pages,
+                    min_window: Duration::from_millis(min_window_ms),
+                    quiet: Duration::from_millis(quiet_ms),
+                    max_window: Duration::from_millis(max_window_ms),
+                },
+            )
+            .await
+        }
+        DaemonRequest::PackRecordingStatus { dev_id } => {
+            handle_pack_recording_status(&pack_recordings, dev_id)
+        }
+        DaemonRequest::AbortPackRecording { dev_id } => {
+            handle_abort_pack_recording(&devices, &pack_recordings, dev_id).await
+        }
+        DaemonRequest::PrefetchStartupPack {
+            image_config,
+            global_config,
+            url,
+            pack_size,
+            index_sha256,
+            mem_virtual_size,
+            timeout_secs,
+        } => {
+            handle_prefetch_startup_pack(
+                &image_service_cache,
+                &startup_pack_handles,
+                image_config,
+                global_config,
+                overlaybd::image_service::StartupPackPrefetch {
+                    url,
+                    pack_size,
+                    index_sha256,
+                    mem_virtual_size,
+                    timeout: Duration::from_secs(timeout_secs),
+                },
+            )
+            .await
         }
         DaemonRequest::AcquireOverlaybd {
             image_config,
@@ -611,8 +734,67 @@ async fn handle_connection(
         }
     };
 
-    send_message(&mut stream, &response).await?;
-    Ok(())
+    let Some(dev_id) = handed_off_dev_id(&response) else {
+        send_message(&mut stream, &response).await?;
+        return Ok(());
+    };
+    if deliver_device_handoff(&mut stream, &response, dev_id).await {
+        return Ok(());
+    }
+
+    // The response was the client's only record of the device, so nobody else
+    // will ever release it. Undo the handoff the way the client would have:
+    // raw devices are deleted, pooled devices return one acquisition (one
+    // shared reference) to the pool.
+    let rollback = match response {
+        DaemonResponse::DeviceAcquired { .. }
+        | DaemonResponse::OverlaybdRuntimeDeviceCreated { .. }
+            if pool_state.is_some() =>
+        {
+            handle_release_overlaybd(&pool_state, rollback_ring, dev_id).await
+        }
+        _ => handle_delete(&devices, rollback_ring, &pack_recordings, dev_id).await,
+    };
+    rollback
+        .map(|_| tracing::info!(dev_id, "rolled back undelivered device handoff"))
+        .with_context(|| format!("roll back undelivered handoff of device {dev_id}"))
+}
+
+/// Returns the device a response hands over to the client, if any.
+fn handed_off_dev_id(response: &DaemonResponse) -> Option<u32> {
+    match response {
+        DaemonResponse::DeviceCreated { dev_id, .. }
+        | DaemonResponse::OverlaybdRuntimeDeviceCreated { dev_id, .. }
+        | DaemonResponse::DeviceAcquired { dev_id, .. } => Some(*dev_id),
+        _ => None,
+    }
+}
+
+/// Sends a device handoff and returns `false` only when the client certainly
+/// did not receive it.
+///
+/// A client reads one response and then closes the connection. On Linux,
+/// closing a Unix stream socket with unread data makes the peer's next read
+/// fail with `ECONNRESET`, so a reset means the client gave up (for example,
+/// its RPC timed out) after the response was written but before reading it.
+/// Any other outcome is treated as delivered: releasing a device the client
+/// still uses is worse than leaking it.
+async fn deliver_device_handoff(
+    stream: &mut tokio::net::UnixStream,
+    response: &DaemonResponse,
+    dev_id: u32,
+) -> bool {
+    if let Err(err) = send_message(stream, response).await {
+        tracing::warn!(dev_id, error = %format!("{err:#}"), "failed to send device handoff");
+        return false;
+    }
+    match stream.read(&mut [0u8; 1]).await {
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+            tracing::warn!(dev_id, "client closed without reading device handoff");
+            false
+        }
+        _ => true,
+    }
 }
 
 // ── Request handlers ────────────────────────────────────────────────────────
@@ -673,7 +855,7 @@ async fn handle_create_overlaybd_runtime_device(
             image_service_cache,
             &runtime.runtime_image_config_path,
             request.global_config,
-            runtime.actual_virtual_size,
+            Some(runtime.actual_virtual_size),
             AccessMode::Exclusive,
         )
         .await
@@ -817,14 +999,20 @@ async fn create_overlaybd_device(
 async fn handle_delete(
     devices: &DashMap<u32, ManagedDevice>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
+    pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
     dev_id: u32,
 ) -> Result<DaemonResponse> {
+    // Abort any pack recording first: its window task must not finalize into
+    // a deleted device's image, and its pack files must not leak.
+    if let Some((_, handle)) = pack_recordings.remove(&dev_id) {
+        abort_pack_recording_handle(&handle).await;
+    }
+
     let Some((_, mut device)) = devices.remove(&dev_id) else {
         bail!("device {dev_id} not found");
     };
 
     quiesce_managed_device(&mut device).await;
-
     // ManagedDevice contains a open fd to the ublk char dev.
     // We need to drop it first, or else, the DEL_DEV command will stuck
     drop(device);
@@ -839,6 +1027,299 @@ async fn handle_delete(
 
 async fn quiesce_managed_device(device: &mut ManagedDevice) {
     quiesce_ublk_device(&mut device.dev).await;
+}
+
+// ── Startup pack recording ──────────────────────────────────────────────────
+
+const PACK_RECORDING_TICK: Duration = Duration::from_millis(100);
+
+/// Window/guard/output parameters for one pack recording (kept as a struct
+/// so handler and window task stay within argument-count lints).
+struct PackRecordingParams {
+    output: PathBuf,
+    max_pages: u32,
+    min_window: Duration,
+    quiet: Duration,
+    max_window: Duration,
+}
+
+async fn handle_start_pack_recording(
+    devices: &DashMap<u32, ManagedDevice>,
+    pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
+    dev_id: u32,
+    params: PackRecordingParams,
+) -> Result<DaemonResponse> {
+    // Replace a finished handle, but never interrupt a live recording.
+    if let Some(existing) = pack_recordings.get(&dev_id) {
+        let finished = !matches!(
+            *existing.state.lock().expect("recording state poisoned"),
+            PackRecordingState::Recording
+        );
+        if !finished {
+            return Ok(DaemonResponse::InvalidRequest {
+                message: format!("pack recording already active on device {dev_id}"),
+            });
+        }
+        drop(existing);
+        pack_recordings.remove(&dev_id);
+    }
+
+    if params.max_pages == 0 {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: "max_pages must be > 0".to_string(),
+        });
+    }
+    if params.quiet.is_zero() {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: "quiet_ms must be > 0".to_string(),
+        });
+    }
+    if params.min_window > params.max_window {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!(
+                "min_window_ms {} exceeds max_window_ms {}",
+                params.min_window.as_millis(),
+                params.max_window.as_millis()
+            ),
+        });
+    }
+    let Some(parent) = params.output.parent() else {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!("pack output {} has no parent dir", params.output.display()),
+        });
+    };
+    if !parent.exists() {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!("pack output dir {} does not exist", parent.display()),
+        });
+    }
+
+    let Some(device) = devices.get(&dev_id) else {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!("device {dev_id} not found"),
+        });
+    };
+    let (target, image) = (Arc::clone(device.dev.target()), Arc::clone(&device.image));
+    drop(device);
+
+    let mem_virtual_size = image.size_bytes();
+    let max_pages =
+        (params.max_pages as usize).min(overlaybd::startup_pack::MAX_PACK_PAGES as usize);
+    let recorder = Arc::new(StartupPackRecorder::new(mem_virtual_size, max_pages));
+    target.set_recorder(Some(Arc::clone(&recorder)));
+    let output = params.output.clone();
+    tracing::info!(
+        dev_id,
+        output = %output.display(),
+        mem_virtual_size,
+        max_pages,
+        "startup pack recording armed"
+    );
+
+    let state = Arc::new(std::sync::Mutex::new(PackRecordingState::Recording));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let finalize_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let task = tokio::spawn(pack_recording_window(
+        Arc::clone(&recorder),
+        target,
+        params,
+        Arc::clone(&state),
+        Arc::clone(&cancelled),
+        Arc::clone(&finalize_gate),
+    ));
+    pack_recordings.insert(
+        dev_id,
+        Arc::new(PackRecordingHandle {
+            output,
+            state,
+            task,
+            cancelled,
+            finalize_gate,
+        }),
+    );
+    Ok(DaemonResponse::Ok)
+}
+
+fn handle_pack_recording_status(
+    pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
+    dev_id: u32,
+) -> Result<DaemonResponse> {
+    let Some(handle) = pack_recordings.get(&dev_id) else {
+        return Ok(DaemonResponse::InvalidRequest {
+            message: format!("no pack recording on device {dev_id}"),
+        });
+    };
+    let state = handle
+        .state
+        .lock()
+        .expect("recording state poisoned")
+        .clone();
+    Ok(DaemonResponse::PackRecording { state })
+}
+
+/// Best-effort startup pack prefetch registration. Every failure mode
+/// (missing image service, no bindable layers, shut-down scheduler) is
+/// logged and answered with `Ok`: resume never depends on the prefetch.
+async fn handle_prefetch_startup_pack(
+    image_service_cache: &Arc<ImageServiceCache>,
+    startup_pack_handles: &Arc<Mutex<Vec<overlaybd::backend::cache::StartupPackHandle>>>,
+    image_config: PathBuf,
+    global_config: PathBuf,
+    pack: overlaybd::image_service::StartupPackPrefetch,
+) -> Result<DaemonResponse> {
+    let image_service = match image_service_cache.get_or_create(&global_config).await {
+        Ok(service) => service,
+        Err(error) => {
+            tracing::warn!(%error, "startup pack prefetch: image service unavailable");
+            return Ok(DaemonResponse::Ok);
+        }
+    };
+    match image_service
+        .prefetch_startup_pack(&image_config, pack)
+        .await
+    {
+        Ok(Some(handle)) => {
+            use overlaybd::backend::cache::StartupPackPhase;
+            let mut handles = startup_pack_handles.lock().await;
+            handles.retain(|existing| {
+                !matches!(
+                    existing.phase(),
+                    StartupPackPhase::Done | StartupPackPhase::Failed | StartupPackPhase::Canceled
+                )
+            });
+            handles.push(handle);
+            tracing::info!(
+                image_config = %image_config.display(),
+                "startup pack prefetch registered"
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                image_config = %image_config.display(),
+                "startup pack prefetch skipped: no bindable layers or cache"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "startup pack prefetch registration failed");
+        }
+    }
+    Ok(DaemonResponse::Ok)
+}
+
+/// Cancel one recording and remove its pack files deterministically: the
+/// packaging pass checks `cancelled` before the final rename, and the
+/// finalize gate makes sure an in-flight rename has settled before any file
+/// removal runs — so a cancelled pack never survives cleanup, while a pack
+/// that completed before the cancel is preserved.
+async fn abort_pack_recording_handle(handle: &PackRecordingHandle) {
+    handle.cancelled.store(true, Ordering::Relaxed);
+    handle.task.abort();
+    let _gate = handle.finalize_gate.lock().await;
+    let done = matches!(
+        *handle.state.lock().expect("recording state poisoned"),
+        PackRecordingState::Done { .. }
+    );
+    let _ = std::fs::remove_file(tmp_pack_path(&handle.output));
+    if !done {
+        let _ = std::fs::remove_file(&handle.output);
+    }
+}
+
+async fn handle_abort_pack_recording(
+    devices: &DashMap<u32, ManagedDevice>,
+    pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
+    dev_id: u32,
+) -> Result<DaemonResponse> {
+    let Some((_, handle)) = pack_recordings.remove(&dev_id) else {
+        return Ok(DaemonResponse::Ok);
+    };
+    if let Some(device) = devices.get(&dev_id) {
+        device.dev.target().set_recorder(None);
+    }
+    abort_pack_recording_handle(&handle).await;
+    Ok(DaemonResponse::Ok)
+}
+
+async fn pack_recording_window(
+    recorder: Arc<StartupPackRecorder>,
+    target: Arc<OverlaybdTarget>,
+    params: PackRecordingParams,
+    state: Arc<std::sync::Mutex<PackRecordingState>>,
+    cancelled: Arc<AtomicBool>,
+    finalize_gate: Arc<tokio::sync::Mutex<()>>,
+) {
+    use uvm_ublk::RecordingVerdict;
+
+    let mut ticker = tokio::time::interval(PACK_RECORDING_TICK);
+    let verdict = loop {
+        ticker.tick().await;
+        let verdict = recorder.verdict(params.min_window, params.quiet, params.max_window);
+        if verdict != RecordingVerdict::Continue {
+            break verdict;
+        }
+    };
+
+    // Recording is over: detach first so no new read is observed.
+    target.set_recorder(None);
+    let output = params.output.clone();
+
+    // Finalizing writes the trace file synchronously; move it off the
+    // daemon's async executor (which also serves ublk device control).
+    let package = |params: &PackRecordingParams| {
+        let recorder = Arc::clone(&recorder);
+        let output = params.output.clone();
+        let cancelled = Arc::clone(&cancelled);
+        tokio::task::spawn_blocking(move || recorder.finalize(&output, &cancelled))
+    };
+
+    let state_value = match verdict {
+        RecordingVerdict::Fail(reason) => {
+            tracing::warn!(reason, "startup pack recording aborted by guard");
+            PackRecordingState::Failed {
+                reason: reason.to_string(),
+            }
+        }
+        RecordingVerdict::Finish => {
+            // Hold the gate across packaging so abort/delete/shutdown cleanup
+            // never removes files from under an in-flight finalize rename.
+            let _gate = finalize_gate.lock().await;
+            match package(&params).await {
+                Ok(Ok(outcome)) => {
+                    tracing::info!(
+                        output = %output.display(),
+                        pages = outcome.pages,
+                        bytes = outcome.bytes,
+                        remote_bytes = outcome.remote_bytes,
+                        skipped_high_pages = outcome.skipped_high_pages,
+                        "startup pack recorded"
+                    );
+                    PackRecordingState::Done {
+                        pages: outcome.pages,
+                        bytes: outcome.bytes,
+                        remote_bytes: outcome.remote_bytes,
+                        path: output,
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(?error, "startup pack packaging failed");
+                    let _ = std::fs::remove_file(tmp_pack_path(&params.output));
+                    PackRecordingState::Failed {
+                        reason: format!("{error:#}"),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "startup pack packaging task failed");
+                    let _ = std::fs::remove_file(tmp_pack_path(&params.output));
+                    PackRecordingState::Failed {
+                        reason: format!("packaging task join failed: {error:#}"),
+                    }
+                }
+            }
+        }
+        RecordingVerdict::Continue => unreachable!("window loop only exits on a terminal verdict"),
+    };
+
+    *state.lock().expect("recording state poisoned") = state_value;
 }
 
 async fn quiesce_ublk_device<T: UVMUblkTarget>(dev: &mut UVMUblkDev<T>) {
@@ -1029,7 +1510,7 @@ async fn handle_acquire_overlaybd(
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
     global_config: &Path,
-    virtual_size: u64,
+    virtual_size: Option<u64>,
     access_mode: AccessMode,
 ) -> Result<DaemonResponse> {
     let pool = pool_state
@@ -1052,11 +1533,13 @@ async fn handle_acquire_overlaybd(
         )
     };
     let actual_virtual_size = image.size_bytes();
-    anyhow::ensure!(
-        virtual_size == actual_virtual_size,
-        "requested overlaybd acquire virtual size {virtual_size} does not match image virtual size {actual_virtual_size}: {}",
-        image_config.display()
-    );
+    if let Some(virtual_size) = virtual_size {
+        anyhow::ensure!(
+            virtual_size == actual_virtual_size,
+            "requested overlaybd acquire virtual size {virtual_size} does not match image virtual size {actual_virtual_size}: {}",
+            image_config.display()
+        );
+    }
 
     match access_mode {
         AccessMode::Exclusive => {
@@ -1500,6 +1983,9 @@ async fn refill_idle_pool_best_effort(
             virtual_size,
             "failed to refill idle overlaybd pool"
         );
+        // Keep refill_inflight set during backoff so concurrent requests cannot
+        // bypass the delay when device creation keeps failing.
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -1667,6 +2153,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_idle_pool_refill_waits_before_retry() {
+        let dir = TempDir::new().unwrap();
+        let image_service = test_image_service(dir.path()).await;
+        let placeholder_dir = dir.path().join("not-a-directory");
+        std::fs::write(&placeholder_dir, b"").unwrap();
+        let pool = PoolState::new(
+            PoolConfig {
+                low_watermark: 1,
+                ..test_pool_config()
+            },
+            0,
+            image_service,
+            placeholder_dir,
+        );
+        let (ctrl_ring, _handle) =
+            storage_util::io_ring::spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+
+        // Fail before allocating any ublk device, and verify repeated failures
+        // leave time between attempts without permanently stopping retries.
+        assert!(refill_idle_pool(&pool, ctrl_ring.clone(), 4096)
+            .await
+            .is_err());
+        for _ in 0..2 {
+            let started = tokio::time::Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                refill_idle_pool_best_effort(&pool, ctrl_ring.clone(), 4096),
+            )
+            .await
+            .expect("failed refill should eventually allow another attempt");
+            assert!(started.elapsed() >= Duration::from_secs(1));
+        }
+    }
+
+    #[tokio::test]
     async fn placeholder_for_builds_cached_same_size_images_per_virtual_size() {
         let dir = TempDir::new().unwrap();
         let image_service = test_image_service(dir.path()).await;
@@ -1713,5 +2234,63 @@ mod tests {
         assert_ne!(small_path, large_path);
         assert_eq!(small.num_lbas(), 8 * 1024 * 1024 / 512);
         assert_eq!(large.num_lbas(), 16 * 1024 * 1024 / 512);
+    }
+
+    fn test_handoff() -> DaemonResponse {
+        DaemonResponse::DeviceAcquired {
+            dev_id: 7,
+            device_path: PathBuf::from("/dev/ublkb7"),
+        }
+    }
+
+    #[tokio::test]
+    async fn device_handoff_read_by_client_is_delivered() {
+        let (mut daemon, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let client = tokio::spawn(async move {
+            let response: DaemonResponse = recv_message(&mut client).await.unwrap().unwrap();
+            assert!(matches!(
+                response,
+                DaemonResponse::DeviceAcquired { dev_id: 7, .. }
+            ));
+        });
+
+        assert!(deliver_device_handoff(&mut daemon, &test_handoff(), 7).await);
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_handoff_to_disconnected_client_is_undelivered() {
+        // The client's RPC timed out and it hung up before the device was ready.
+        let (mut daemon, client) = tokio::net::UnixStream::pair().unwrap();
+        drop(client);
+
+        assert!(!deliver_device_handoff(&mut daemon, &test_handoff(), 7).await);
+    }
+
+    #[tokio::test]
+    async fn device_handoff_dropped_unread_is_undelivered() {
+        // The client's RPC timed out after the response was written but before
+        // the client read it.
+        let (mut daemon, client) = tokio::net::UnixStream::pair().unwrap();
+        let client = tokio::spawn(async move {
+            client.readable().await.unwrap();
+            drop(client);
+        });
+
+        assert!(!deliver_device_handoff(&mut daemon, &test_handoff(), 7).await);
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_handoff_dropped_mid_read_is_undelivered() {
+        let (mut daemon, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let client = tokio::spawn(async move {
+            let mut len_prefix = [0u8; 4];
+            client.read_exact(&mut len_prefix).await.unwrap();
+            drop(client);
+        });
+
+        assert!(!deliver_device_handoff(&mut daemon, &test_handoff(), 7).await);
+        client.await.unwrap();
     }
 }

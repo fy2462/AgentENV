@@ -1,18 +1,23 @@
 pub mod api;
 pub mod api_key;
 pub mod cfg;
+mod deps;
 mod digest;
 pub mod identity;
 pub mod image;
 mod local_store;
 pub mod logging;
 mod managed_secret;
+#[cfg(test)]
+mod module_cycles;
 pub mod observability;
 pub mod orchestrator;
 pub mod overlaybd;
 pub mod p2p;
 pub mod privileges;
+pub mod prometheus;
 mod proto;
+pub mod repository;
 pub mod sandbox;
 pub mod setup;
 pub mod snapshot;

@@ -29,10 +29,8 @@ use tracing::{debug, warn};
 use super::process_vm_reader::ProcessVmReader;
 use super::sandbox::managed_snapshot_base;
 use crate::cfg::ConfigManager;
-use crate::sandbox::ublk::UblkDevice;
-use crate::sandbox::ublk::{
-    compact_layers, create_commit_args, OverlaybdCompactOutput, UblkDeviceManager,
-};
+use crate::overlaybd::{compact_layers, create_commit_args, OverlaybdCompactOutput};
+use crate::sandbox::ublk::{UblkDevice, UblkDeviceManager};
 use crate::sandbox::SandboxCaptureError;
 
 /// Base budget of runtime-owned overlaybd snapshot lowers before compaction
@@ -544,16 +542,18 @@ async fn capture_live_overlaybd_snapshot(
                     "read restack snapshot layer metadata {}",
                     snapshot_layer_path.display()
                 )
-            })?
+            })
+            .map_err(into_terminal_snapshot_failure)?
             .len();
         if copied_size != descriptor.size {
-            let _ = fs::remove_file(&snapshot_layer_path);
-            anyhow::bail!(
+            // Keep the sealed layer: the live device may still reference it,
+            // and terminal deletion marks the volume failed for recovery.
+            return Err(into_terminal_snapshot_failure(anyhow::anyhow!(
                 "restack snapshot descriptor size mismatch for {}: descriptor says {}, file has {}",
                 snapshot_layer_path.display(),
                 descriptor.size,
                 copied_size
-            );
+            )));
         }
     }
 

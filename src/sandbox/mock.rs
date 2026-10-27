@@ -17,13 +17,13 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use super::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxBackendFactory,
+    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
+use crate::types::RuntimeArtifactSet;
 
 #[derive(Debug)]
 pub struct MockSnapshot;
@@ -51,7 +51,9 @@ pub enum MockOperation {
     Pause,
     Resume,
     Snapshot,
+    CaptureToDir,
     SnapshotVolumes,
+    ThawVolumes,
     Fork,
     ForkChild,
     Stop,
@@ -72,12 +74,17 @@ pub struct MockBehavior {
     actions: Mutex<HashMap<MockOperation, VecDeque<MockAction>>>,
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
+    envd: Mutex<Option<Arc<dyn super::EnvdApi>>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
 }
 
 impl MockBehavior {
+    pub fn set_envd(&self, envd: Arc<dyn super::EnvdApi>) {
+        *self.envd.lock().unwrap() = Some(envd);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -245,6 +252,7 @@ impl MockBehavior {
 pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
+    volumes_frozen: bool,
 }
 
 impl MockSandboxBackend {
@@ -256,12 +264,20 @@ impl MockSandboxBackend {
         behavior: Arc<MockBehavior>,
         host_ip: Option<std::net::Ipv4Addr>,
     ) -> Self {
-        Self { behavior, host_ip }
+        Self {
+            behavior,
+            host_ip,
+            volumes_frozen: false,
+        }
     }
 }
 
 #[async_trait]
 impl SandboxBackend for MockSandboxBackend {
+    fn envd(&self) -> Option<Arc<dyn super::EnvdApi>> {
+        self.behavior.envd.lock().unwrap().clone()
+    }
+
     async fn start(&mut self) -> Result<()> {
         self.behavior.apply_async(MockOperation::Start).await
     }
@@ -304,7 +320,26 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior
             .apply_capture_result(MockOperation::Snapshot)
             .await?;
-        Ok(CapturedSandboxSnapshot::new(MockCapturedSnapshot))
+        Ok(CapturedSandboxSnapshot::new(
+            crate::snapshot::SandboxSnapshotManifest::for_test(4096, &[]),
+            MockCapturedSnapshot,
+        ))
+    }
+
+    async fn capture_to_dir(
+        &mut self,
+        _at: &std::path::Path,
+    ) -> SandboxCaptureResult<(
+        crate::sandbox::SandboxSnapshotManifest,
+        Option<Box<dyn std::any::Any + Send>>,
+    )> {
+        self.behavior
+            .apply_capture_result(MockOperation::CaptureToDir)
+            .await?;
+        Ok((
+            crate::sandbox::SandboxSnapshotManifest::for_test(4096, &[]),
+            None,
+        ))
     }
 
     async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
@@ -336,7 +371,28 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        self.behavior.apply_async(MockOperation::Stop).await
+        self.behavior.apply_async(MockOperation::Stop).await?;
+        self.volumes_frozen = false;
+        Ok(())
+    }
+
+    async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
+        assert!(!self.volumes_frozen, "volumes already frozen");
+        let result = self.snapshot_volumes().await;
+        self.volumes_frozen = result
+            .as_ref()
+            .err()
+            .is_none_or(|error| error.is_terminal());
+        result
+    }
+
+    async fn thaw_volumes(&mut self) -> Result<()> {
+        anyhow::ensure!(self.volumes_frozen, "volumes are not frozen");
+        self.behavior
+            .apply_async(MockOperation::ThawVolumes)
+            .await?;
+        self.volumes_frozen = false;
+        Ok(())
     }
 
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {

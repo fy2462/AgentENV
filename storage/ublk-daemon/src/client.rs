@@ -9,7 +9,8 @@ use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, RestackSnapshotStats,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
+    RestackSnapshotStats,
 };
 use overlaybd::config::UpperMode;
 
@@ -129,6 +130,8 @@ struct UblkDaemonClientInner {
     socket_path: PathBuf,
     /// Set to `true` when the daemon process exits (expected or unexpected).
     daemon_dead: AtomicBool,
+    /// Retains completion so shutdown callers cannot miss the watchdog's exit.
+    daemon_exited: tokio::sync::watch::Sender<bool>,
     /// Set to `true` when `shutdown()` is called, so the watchdog task
     /// doesn't log the expected exit as an error.
     shutting_down: AtomicBool,
@@ -224,6 +227,7 @@ impl UblkDaemonClient {
             inner: Arc::new(UblkDaemonClientInner {
                 socket_path: config.socket_path,
                 daemon_dead: AtomicBool::new(false),
+                daemon_exited: tokio::sync::watch::channel(false).0,
                 shutting_down: AtomicBool::new(false),
                 death_reason: Mutex::new(None),
                 runtime_device_timeout: config.runtime_device_timeout,
@@ -323,6 +327,7 @@ impl UblkDaemonClient {
 
             *inner.death_reason.lock().unwrap() = Some(reason);
             inner.daemon_dead.store(true, Ordering::Release);
+            inner.daemon_exited.send_replace(true);
         });
     }
 
@@ -383,6 +388,99 @@ impl UblkDaemonClient {
                 bail!("daemon: notify sandbox ready failed: {message}")
             }
             other => bail!("daemon: unexpected response for notify sandbox ready: {other:?}"),
+        }
+    }
+
+    /// Arm a startup-pack first-touch recorder on `dev_id`. When the
+    /// recording window ends the daemon packages the recorded pages into
+    /// `output` and reports the result through [`Self::pack_recording_status`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_pack_recording(
+        &self,
+        dev_id: u32,
+        output: &Path,
+        max_pages: u32,
+        min_window_ms: u64,
+        quiet_ms: u64,
+        max_window_ms: u64,
+    ) -> Result<()> {
+        let request = DaemonRequest::StartPackRecording {
+            dev_id,
+            output: output.to_path_buf(),
+            max_pages,
+            min_window_ms,
+            quiet_ms,
+            max_window_ms,
+        };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::InvalidRequest { message } => {
+                bail!("daemon: start pack recording rejected: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: start pack recording failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for start pack recording: {other:?}"),
+        }
+    }
+
+    /// Poll the state of the pack recording running on `dev_id`.
+    pub async fn pack_recording_status(&self, dev_id: u32) -> Result<PackRecordingState> {
+        let request = DaemonRequest::PackRecordingStatus { dev_id };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::PackRecording { state } => Ok(state),
+            DaemonResponse::InvalidRequest { message } => {
+                bail!("daemon: pack recording status rejected: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: pack recording status failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for pack recording status: {other:?}"),
+        }
+    }
+
+    /// Abort the pack recording on `dev_id` (idempotent): detach the
+    /// recorder, stop the window task, and remove any partial pack output.
+    pub async fn abort_pack_recording(&self, dev_id: u32) -> Result<()> {
+        let request = DaemonRequest::AbortPackRecording { dev_id };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::Error { message } => {
+                bail!("daemon: abort pack recording failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for abort pack recording: {other:?}"),
+        }
+    }
+
+    /// Best-effort: register a startup pack prefetch for the memory image at
+    /// `image_config`. The daemon deduplicates by pack identity and always
+    /// answers `Ok`; failures are logged daemon-side only.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prefetch_startup_pack(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        url: &str,
+        pack_size: u64,
+        index_sha256: &str,
+        mem_virtual_size: u64,
+        timeout_secs: u64,
+    ) -> Result<()> {
+        let request = DaemonRequest::PrefetchStartupPack {
+            image_config: image_config.to_path_buf(),
+            global_config: global_config.to_path_buf(),
+            url: url.to_string(),
+            pack_size,
+            index_sha256: index_sha256.to_string(),
+            mem_virtual_size,
+            timeout_secs,
+        };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::Error { message } => {
+                bail!("daemon: prefetch startup pack failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for prefetch startup pack: {other:?}"),
         }
     }
 
@@ -459,7 +557,14 @@ impl UblkDaemonClient {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
         };
-        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+        // A lost reply can follow a successful seal. Only an explicit Error
+        // response establishes that the runtime is still safe to resume.
+        let response = self.call(request, SNAPSHOT_TIMEOUT).await.context(
+            RestackSnapshotTerminalFailure::new(format!(
+                "daemon: restack snapshot dev_id={dev_id} outcome unknown"
+            )),
+        )?;
+        match response {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
                 data_stat,
@@ -478,7 +583,10 @@ impl UblkDaemonClient {
             DaemonResponse::Error { message } => {
                 bail!("daemon: restack snapshot dev_id={dev_id} failed: {message}")
             }
-            other => bail!("daemon: unexpected response for restack snapshot: {other:?}"),
+            other => Err(RestackSnapshotTerminalFailure::new(format!(
+                "daemon: unexpected response for restack snapshot: {other:?}"
+            ))
+            .into()),
         }
     }
 
@@ -492,6 +600,12 @@ impl UblkDaemonClient {
         let _ = self
             .call(DaemonRequest::Shutdown, Duration::from_secs(5))
             .await;
+        self.inner
+            .daemon_exited
+            .subscribe()
+            .wait_for(|exited| *exited)
+            .await
+            .context("wait for ublk daemon exit")?;
         Ok(())
     }
 
@@ -516,7 +630,7 @@ impl UblkDaemonClient {
         &self,
         image_config: &Path,
         global_config: &Path,
-        virtual_size: u64,
+        virtual_size: Option<u64>,
         access_mode: AccessMode,
     ) -> Result<(u32, PathBuf)> {
         let request = DaemonRequest::AcquireOverlaybd {
@@ -638,6 +752,7 @@ impl UblkDaemonClient {
             inner: Arc::new(UblkDaemonClientInner {
                 socket_path,
                 daemon_dead: AtomicBool::new(daemon_dead),
+                daemon_exited: tokio::sync::watch::channel(true).0,
                 shutting_down: AtomicBool::new(false),
                 death_reason: Mutex::new(if daemon_dead {
                     Some("test: daemon marked dead".into())
@@ -653,6 +768,57 @@ impl UblkDaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_child_exit_after_rpc_ack() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("shutdown.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let client = UblkDaemonClient::new_for_test(sock_path, false);
+        // The child cannot exit until the test releases its stdin gate.
+        client.inner.daemon_exited.send_replace(false);
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut gate = child.stdin.take().unwrap();
+        UblkDaemonClient::spawn_watchdog(client.inner.clone(), child);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: DaemonRequest = recv_message(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(request, DaemonRequest::Shutdown));
+            send_message(&mut stream, &DaemonResponse::Ok)
+                .await
+                .unwrap();
+            ack_tx.send(()).unwrap();
+        });
+        let shutdown_client = client.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
+        ack_rx.await.unwrap();
+        let returned_early = tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_ok();
+        gate.write_all(b"exit\n").await.unwrap();
+        if !returned_early {
+            tokio::time::timeout(Duration::from_secs(3), shutdown)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            !returned_early,
+            "shutdown returned before daemon cleanup/exit"
+        );
+        assert!(client.inner.daemon_dead.load(Ordering::Acquire));
+        // Repeated shutdown must also observe the already-completed exit.
+        client.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn daemon_dead_fails_immediately() {
@@ -706,6 +872,30 @@ mod tests {
             .create_overlaybd(Path::new("/img.json"), Path::new("/global.json"))
             .await;
         assert!(err.is_err(), "should fail when no server is listening");
+    }
+
+    #[tokio::test]
+    async fn restack_lost_reply_is_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("restack.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let client = UblkDaemonClient::new_for_test(socket, false);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                recv_message::<DaemonRequest>(&mut stream).await.unwrap(),
+                Some(DaemonRequest::RestackSnapshot { .. })
+            ));
+            // Consume the request, then close without replying: the client
+            // cannot know whether the live upper was already sealed.
+        });
+
+        let error = client
+            .restack_snapshot(0, Path::new("/snapshot.commit"))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(error.is::<RestackSnapshotTerminalFailure>(), "{error:#}");
     }
 
     #[tokio::test]

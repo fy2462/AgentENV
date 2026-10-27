@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
         &cluster_cpu_arc,
     )));
-    let image_resolver = Arc::new(ImageResolver::new(config));
+    let image_resolver = ImageResolver::new(config).with_repository(snapshot_manager.repository());
     let volume_manager = Arc::new(
         VolumeManager::open_with_repository_and_limits(
             config.home_path.join("volumes/catalog"),
@@ -164,13 +164,16 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&orchestrator),
         snapshot_manager,
         template_builder,
-        image_resolver,
+        Arc::new(image_resolver),
         volume_manager,
         observability,
         config.sandbox_proxy.domains.clone(),
         api_key,
     ));
-    let app = server::new(api_impl);
+    if let Err(error) = api_impl.recover_image_builds().await {
+        warn!(error = %format_args!("{error:#}"), "build recovery unavailable; will retry after startup");
+    }
+    let app = server::new(Arc::clone(&api_impl));
     let shutdown_orchestrator = Arc::clone(&orchestrator);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -183,9 +186,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     info!(target: "agentenv", addr = %addr, "API server listening");
+    let build_cleanup = api_impl.start_image_build_cleanup();
 
     let shutdown_cleanup = tokio::spawn(async move {
         if let Ok(()) = shutdown_rx.await {
+            // Stop new startup-manifest continuations, then drain the
+            // in-flight ones (bounded): their manifests still land instead
+            // of being canceled, while this shutdown cannot hang on
+            // dying-daemon RPC timeouts.
+            agentenv::snapshot::drain_startup_manifest_tasks(std::time::Duration::from_secs(15))
+                .await;
+            build_cleanup.abort();
+            let _ = build_cleanup.await;
             if let Some(mut handle) = reporter.take() {
                 info!(target: "agentenv", "stopping observability reporter before process exit");
                 if let Err(err) = handle.shutdown().await {

@@ -1251,6 +1251,9 @@ async fn test_open_entry_is_not_removed_by_eviction() {
     let mut opt = test_options(tmp.path());
     opt.capacity_bytes = 6 * 1024;
     opt.block_size = 4096;
+    // Open-entry block eviction disabled: capacity eviction must skip open
+    // entries entirely (the pre-existing behavior).
+    opt.open_evict_idle = std::time::Duration::ZERO;
     let backend = FileCacheBackend::with_options(opt).await.expect("backend");
 
     let payload_a = uniform_char_random_data(8192, 0xaaa1);
@@ -1438,6 +1441,10 @@ async fn test_ro_cached_fs_basic() {
         .expect("read full refill");
     assert_eq!(full.as_ref(), refill_payload.as_slice());
 
+    // Cached read results hold a read permit on the entry's refill/eviction
+    // barrier for their lifetime; release them before evicting the entry.
+    drop((got, got_again, mixed, mixed_again));
+
     // Ported from C++ commonTest refill(2) + fadvise(POSIX_FADV_WILLNEED).
     cached.evict_all().await.expect("evict all");
     assert_eq!(
@@ -1456,6 +1463,9 @@ async fn test_ro_cached_fs_basic() {
         .await
         .expect("read prefetched from cache-only");
     assert_eq!(prefetched.as_ref(), &payload[page_size..page_size * 3]);
+    // Same as above: release the read permit held by the cached read result
+    // before evicting the entry.
+    drop(prefetched);
 
     cached
         .fadvise(234, (5000 * page_size) as u64, CacheAdvice::WillNeed)
@@ -1783,6 +1793,9 @@ async fn test_cache_pool_style_rename_and_evict() {
         .await
         .expect("read renamed cache");
     assert_eq!(got.as_ref(), &payload[..4096]);
+    // The read result holds a read permit on the entry's barrier; release it
+    // before the entry is evicted below.
+    drop(got);
     drop(cache_only);
 
     backend
@@ -2001,6 +2014,590 @@ async fn test_cache_pool_controls_stat_list_and_evict_size() {
 }
 
 #[tokio::test]
+async fn test_mmap_capacity_initial_limit_and_growth_are_shared() {
+    let tmp = tempdir().expect("create tempdir");
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let mut options = test_options(tmp.path());
+    options.mmap_capacity_bytes = page;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    assert_eq!(backend.mmap_capacity_bytes(), page);
+    // Allocation is allowed above the limit; it is an asynchronous GC policy.
+    let a = backend
+        .open_cache_only("grow-map-a", page)
+        .await
+        .expect("open a");
+    let b = backend
+        .open_cache_only("grow-map-b", page)
+        .await
+        .expect("open b");
+    assert_eq!(backend.stats().mmap_bytes, 2 * page);
+    let clone = backend.clone();
+    clone.set_mmap_capacity_bytes(4 * page);
+    assert_eq!(backend.mmap_capacity_bytes(), 4 * page);
+    drop(a);
+    drop(b);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().entries, 2);
+    assert_eq!(backend.stats().mmap_bytes, 2 * page);
+    assert!(!backend.state.is_full.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn test_mmap_capacity_background_gc_reclaims_empty_entries_by_lru() {
+    let tmp = tempdir().expect("create tempdir");
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend");
+    assert_eq!(backend.mmap_capacity_bytes(), 32 * 1024 * GIB);
+    let open = backend
+        .open_cache_only("open-map", page)
+        .await
+        .expect("open");
+    for (key, age) in [("old-empty-map", 1), ("new-empty-map", 2)] {
+        drop(
+            backend
+                .open_cache_only(key, page)
+                .await
+                .expect("empty mapping"),
+        );
+        backend
+            .get_cache_entry(&super::cache_key_digest(key))
+            .unwrap()
+            .last_access_nanos
+            .store(age, Ordering::Relaxed);
+    }
+    assert_eq!(backend.stats().bytes_used, 0);
+    assert_eq!(backend.stats().mmap_bytes, 3 * page);
+    backend.set_mmap_capacity_bytes(3 * page);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.stats().mmap_bytes != 2 * page {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("periodic mmap GC");
+    assert!(backend.file_stats("old-empty-map").is_none());
+    assert!(backend.file_stats("new-empty-map").is_some());
+    assert!(backend.file_stats("open-map").is_some());
+
+    backend.set_mmap_capacity_bytes(0);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().mmap_bytes, page);
+    // Filling an existing mapping consumes no more VA, even above the mmap limit.
+    assert!(!backend.state.is_full.load(Ordering::Relaxed));
+    open.refill_from_slice(0, &vec![0x5a; page as usize])
+        .await
+        .expect("fill open mapping");
+    assert_eq!(backend.stats().mmap_bytes, page);
+    drop(open);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().mmap_bytes, 0);
+}
+
+#[tokio::test]
+async fn test_mmap_capacity_gc_satisfies_disk_and_mapping_targets() {
+    let tmp = tempdir().expect("create tempdir");
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let mut options = test_options(tmp.path());
+    options.block_size = page;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let large = backend
+        .open_cache_only("large-empty", 4 * page)
+        .await
+        .expect("large mapping");
+    let empty = backend
+        .open_cache_only("small-empty", page)
+        .await
+        .expect("empty mapping");
+    let a = backend
+        .open_cache_only("data-a", page)
+        .await
+        .expect("open a");
+    let b = backend
+        .open_cache_only("data-b", page)
+        .await
+        .expect("open b");
+    a.refill_from_slice(0, &vec![1; page as usize])
+        .await
+        .expect("fill a");
+    b.refill_from_slice(0, &vec![2; page as usize])
+        .await
+        .expect("fill b");
+    backend.set_capacity_bytes(page);
+    backend.set_mmap_capacity_bytes(4 * page);
+    drop((large, empty, a, b));
+    for (key, age) in [
+        ("large-empty", 1),
+        ("small-empty", 2),
+        ("data-a", 3),
+        ("data-b", 4),
+    ] {
+        backend
+            .get_cache_entry(&super::cache_key_digest(key))
+            .unwrap()
+            .last_access_nanos
+            .store(age, Ordering::Relaxed);
+    }
+    backend.eviction_inner().await;
+    // An overlapping periodic pass may own an entry whose I/O is still pending.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.stats().bytes_used != 0 || backend.stats().mmap_bytes > page {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both GC targets settle");
+    // Removing the large mapping alone satisfies VA pressure, but disk
+    // pressure still requires both data entries to go. The shared idle LRU
+    // may also remove the small empty entry while satisfying the disk target.
+    assert!(backend.file_stats("large-empty").is_none());
+    assert!(backend.file_stats("data-a").is_none());
+    assert!(backend.file_stats("data-b").is_none());
+    assert_eq!(backend.stats().bytes_used, 0);
+    assert!(backend.stats().mmap_bytes <= page);
+}
+
+#[tokio::test]
+async fn test_mmap_capacity_disk_gc_also_reclaims_empty_entries() {
+    let tmp = tempdir().expect("create tempdir");
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend");
+    drop(
+        backend
+            .open_cache_only("empty-without-va-pressure", page)
+            .await
+            .expect("empty mapping"),
+    );
+    let data = backend
+        .open_cache_only("disk-pressure", page)
+        .await
+        .expect("data mapping");
+    data.refill_from_slice(0, &vec![0x5a; page as usize])
+        .await
+        .expect("fill");
+    backend.set_capacity_bytes(0);
+    drop(data);
+    // An empty entry can be visited before a data-bearing one. It contributes
+    // zero disk bytes, so eviction must continue until the data target is met.
+    for (key, age) in [("empty-without-va-pressure", 1), ("disk-pressure", 2)] {
+        backend
+            .get_cache_entry(&super::cache_key_digest(key))
+            .unwrap()
+            .last_access_nanos
+            .store(age, Ordering::Relaxed);
+    }
+    backend.eviction_inner().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.stats().bytes_used != 0 || backend.stats().mmap_bytes != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("disk-only GC settles");
+    assert!(backend.file_stats("disk-pressure").is_none());
+    assert!(backend.file_stats("empty-without-va-pressure").is_none());
+}
+
+#[tokio::test]
+async fn test_mmap_capacity_gc_preserves_inflight_refills() {
+    let tmp = tempdir().expect("create tempdir");
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let mut options = test_options(tmp.path());
+    options.mmap_capacity_bytes = 0;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let file = backend
+        .open_cache_only("refilling", page)
+        .await
+        .expect("open");
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("refilling"))
+        .unwrap();
+    assert!(matches!(
+        entry.acquire_refill(0).await,
+        super::full_file_cache::cache_entry::AcquireRefillResult::ShouldLoad
+    ));
+    drop(file);
+    assert_eq!(entry.open_count.load(Ordering::SeqCst), 0);
+    backend.eviction_inner().await;
+    assert!(backend.file_stats("refilling").is_some());
+    assert_eq!(backend.stats().mmap_bytes, page);
+    entry.finish_refill(0);
+    drop(entry);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().mmap_bytes, 0);
+}
+
+#[tokio::test]
+async fn test_mmap_capacity_applies_to_restored_idle_entries() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    {
+        let backend = FileCacheBackend::with_options(options.clone())
+            .await
+            .expect("backend");
+        let file = backend
+            .open_cache_only("restored-idle", 4096)
+            .await
+            .expect("open");
+        file.sync().await.expect("persist entry");
+    }
+    options.mmap_capacity_bytes = 0;
+    let restored = FileCacheBackend::with_options(options)
+        .await
+        .expect("restore");
+    assert_eq!(restored.mmap_capacity_bytes(), 0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while restored.stats().mmap_bytes != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("periodic GC after restore");
+    assert_eq!(restored.stats().entries, 0);
+}
+
+#[tokio::test]
+async fn test_mmap_stats_count_sparse_files_and_reused_handles() {
+    let tmp = tempdir().expect("create tempdir");
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend");
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    assert_eq!(backend.stats().mmap_bytes, 0);
+    backend
+        .open_cache_only("empty", 0)
+        .await
+        .expect_err("zero size");
+    assert_eq!(backend.stats().mmap_bytes, 0);
+
+    let file = backend
+        .open_cache_only("sparse", page_size + 1)
+        .await
+        .expect("open sparse");
+    assert_eq!(backend.stats().mmap_bytes, 2 * page_size);
+    assert_eq!(backend.stats().bytes_used, 0);
+    let clone = backend.clone();
+    let other_handle = clone
+        .open_cache_only("sparse", page_size + 1)
+        .await
+        .expect("reopen");
+    assert_eq!(clone.stats().mmap_bytes, 2 * page_size);
+    drop(other_handle);
+    drop(file);
+    // Closing handles does not remove the entry or its mapping from the pool.
+    assert_eq!(backend.stats().mmap_bytes, 2 * page_size);
+    backend.evict_global().await.expect("remove idle mapping");
+    assert_eq!(backend.stats().mmap_bytes, 0);
+}
+
+#[tokio::test]
+async fn test_mmap_eviction_waits_for_last_bytes_clone() {
+    use super::full_file_cache::cache_pool::CacheSlot;
+
+    let tmp = tempdir().expect("create tempdir");
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend");
+    let file = backend
+        .open_cache_only("held-bytes", 4096)
+        .await
+        .expect("open");
+    file.refill_from_slice(0, &[0x5a; 4096])
+        .await
+        .expect("fill");
+    let bytes = file.read_at(0, 4096).await.expect("read");
+    let other_bytes = bytes.clone();
+    let mapped = backend.stats().mmap_bytes;
+    assert!(mapped >= 4096);
+    drop(file);
+
+    // Drive eviction on this single-thread runtime until it waits for the
+    // read permit held by Bytes. No spawned task or timing-based sleep needed.
+    let eviction = backend.evict_global();
+    tokio::pin!(eviction);
+    assert!(futures_util::poll!(eviction.as_mut()).is_pending());
+    let cache_id = super::cache_key_digest("held-bytes");
+    assert!(matches!(
+        backend.state.cache_entries.get(&cache_id).unwrap().value(),
+        CacheSlot::Evicting(_)
+    ));
+    assert_eq!(backend.stats().mmap_bytes, mapped);
+    assert_eq!(bytes.as_ref(), &[0x5a; 4096]);
+
+    drop(bytes);
+    assert!(futures_util::poll!(eviction.as_mut()).is_pending());
+    assert_eq!(backend.stats().mmap_bytes, mapped);
+    assert_eq!(other_bytes.as_ref(), &[0x5a; 4096]);
+
+    drop(other_bytes);
+    tokio::time::timeout(Duration::from_secs(5), eviction)
+        .await
+        .expect("eviction did not finish after releasing all Bytes")
+        .expect("evict");
+    let stats = backend.stats();
+    assert_eq!(stats.entries, 0);
+    assert_eq!(stats.bytes_used, 0);
+    assert_eq!(stats.mmap_bytes, 0);
+}
+
+#[tokio::test]
+async fn test_mmap_stats_do_not_decrease_when_only_blocks_are_evicted() {
+    let tmp = tempdir().expect("create tempdir");
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend");
+    let file = backend.open_cache_only("punch", 4096).await.expect("open");
+    file.refill_from_slice(0, &[0x5a; 4096])
+        .await
+        .expect("fill");
+    let mapped = backend.stats().mmap_bytes;
+    file.evict_all().await.expect("punch cached blocks");
+    assert_eq!(backend.stats().bytes_used, 0);
+    assert_eq!(backend.stats().mmap_bytes, mapped);
+    drop(file);
+    backend.evict_global().await.expect("remove mapping");
+    assert_eq!(backend.stats().mmap_bytes, 0);
+}
+
+#[tokio::test]
+async fn test_mmap_stats_restore_and_release_with_backend() {
+    let tmp = tempdir().expect("create tempdir");
+    let options = test_options(tmp.path());
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let backend = FileCacheBackend::with_options(options.clone())
+        .await
+        .expect("backend");
+    let file = backend
+        .open_cache_only("persist-mapping", page_size + 1)
+        .await
+        .expect("open");
+    file.sync().await.expect("persist sparse entry");
+    let total = backend.state.mmap_bytes.clone();
+    drop(file);
+    drop(backend);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while total.load(Ordering::Relaxed) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("release backend mappings");
+
+    let restored = FileCacheBackend::with_options(options)
+        .await
+        .expect("restore");
+    assert_eq!(restored.stats().entries, 1);
+    assert_eq!(restored.stats().bytes_used, 0);
+    assert_eq!(restored.stats().mmap_bytes, 2 * page_size);
+    // Rename creates a replacement mapping and must retire the old charge.
+    restored
+        .rename_store_key("persist-mapping", "renamed-mapping")
+        .await
+        .expect("rename");
+    assert_eq!(restored.stats().mmap_bytes, 2 * page_size);
+    restored
+        .evict_global()
+        .await
+        .expect("remove restored mapping");
+    assert_eq!(restored.stats().mmap_bytes, 0);
+}
+
+#[tokio::test]
+async fn test_runtime_capacity_is_shared_and_updates_pressure_and_stats() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    options.capacity_bytes = 64 * 1024;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let clone = backend.clone();
+    let file = backend
+        .open_cache_only("runtime-limit", 8192)
+        .await
+        .expect("open");
+    file.refill_from_slice(0, &[0x5a; 8192])
+        .await
+        .expect("fill");
+    assert_eq!(backend.capacity_bytes(), 64 * 1024);
+    assert!(!backend.state.is_full.load(Ordering::Relaxed));
+
+    clone.set_capacity_bytes(8192);
+    assert_eq!(backend.capacity_bytes(), 8192);
+    assert_eq!(backend.stat_path(None).expect("pool stat").total_size, 2);
+    assert!(backend.state.is_full.load(Ordering::Relaxed));
+
+    backend.set_capacity_bytes(64 * 1024);
+    assert_eq!(clone.capacity_bytes(), 64 * 1024);
+    assert_eq!(
+        clone.stat_path(Some("/")).expect("pool stat").total_size,
+        16
+    );
+    // A file's capacity is its logical size, independent of the pool limit.
+    assert_eq!(
+        clone
+            .stat_path(Some("runtime-limit"))
+            .expect("file stat")
+            .total_size,
+        2
+    );
+    assert!(!backend.state.is_full.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn test_runtime_capacity_shrink_background_gc_preserves_open_entries() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let open = backend
+        .open_cache_only("keep-open", 4096)
+        .await
+        .expect("open");
+    open.refill_from_slice(0, &[0x5a; 4096])
+        .await
+        .expect("fill open");
+    for key in ["idle-a", "idle-b"] {
+        let idle = backend.open_cache_only(key, 4096).await.expect("open idle");
+        idle.refill_from_slice(0, &[0x6b; 4096])
+            .await
+            .expect("fill idle");
+    }
+    assert_eq!(backend.stats().bytes_used, 3 * 4096);
+
+    backend.set_capacity_bytes(8192);
+    // No explicit eviction call: the existing periodic worker must see the update.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.stats().bytes_used != 4096 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("periodic GC after shrinking capacity");
+    assert!(backend.file_stats("idle-a").is_none());
+    assert!(backend.file_stats("idle-b").is_none());
+    assert_eq!(
+        open.read_at(0, 4096).await.expect("read open").as_ref(),
+        &[0x5a; 4096]
+    );
+
+    // Zero still cannot evict an open entry, even when all its bytes exceed the limit.
+    backend.set_capacity_bytes(0);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().bytes_used, 4096);
+    drop(open);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().bytes_used, 0);
+}
+
+#[tokio::test]
+async fn test_runtime_capacity_growth_keeps_idle_cache_and_allows_refill() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    options.capacity_bytes = 8192;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let a = backend
+        .open_cache_only("grow-a", 4096)
+        .await
+        .expect("open a");
+    let b = backend
+        .open_cache_only("grow-b", 4096)
+        .await
+        .expect("open b");
+    a.refill_from_slice(0, &[1; 4096]).await.expect("fill a");
+    b.refill_from_slice(0, &[2; 4096]).await.expect("fill b");
+    assert!(backend.state.is_full.load(Ordering::Relaxed));
+
+    backend.set_capacity_bytes(64 * 1024);
+    drop(a);
+    drop(b);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().bytes_used, 8192);
+    assert!(backend.file_stats("grow-a").is_some());
+    assert!(backend.file_stats("grow-b").is_some());
+
+    let c = backend
+        .open_cache_only("grow-c", 4096)
+        .await
+        .expect("open c");
+    c.refill_from_slice(0, &[3; 4096])
+        .await
+        .expect("fill beyond old capacity");
+    assert_eq!(backend.stats().bytes_used, 3 * 4096);
+}
+
+#[tokio::test]
+async fn test_runtime_capacity_zero_and_restore_affect_existing_file() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(MockSource::new(vec![0x5a; 3 * 4096], Duration::ZERO));
+    let background_source: Arc<dyn VirtualFile> = source.clone();
+    let file = backend
+        .open_file("toggle-refill", source.clone())
+        .await
+        .expect("open");
+    let _ = file.read_at(0, 4096).await.expect("warm block");
+    assert_eq!(backend.stats().bytes_used, 4096);
+
+    backend.set_capacity_bytes(0);
+    let before_hit = source.read_calls();
+    let _ = file
+        .read_at(0, 4096)
+        .await
+        .expect("cached hit while disabled");
+    assert_eq!(source.read_calls(), before_hit);
+    let _ = file
+        .read_at(4096, 4096)
+        .await
+        .expect("source read while disabled");
+    assert_eq!(backend.stats().bytes_used, 4096);
+    assert_eq!(file.query(4096, 4096).await.expect("uncached block"), 4096);
+    let err = file
+        .refill_from_slice(4096, &[0x5a; 4096])
+        .await
+        .expect_err("disabled writes");
+    assert_eq!(err.downcast_ref::<Errno>(), Some(&Errno::ENOSPC));
+    let err = file
+        .background_refill_range(&background_source, 3 * 4096, 2, 1)
+        .await
+        .expect_err("disabled background fill");
+    assert_eq!(err.downcast_ref::<Errno>(), Some(&Errno::ENOSPC));
+
+    backend.set_capacity_bytes(64 * 1024);
+    let mut buf = [0; 4096];
+    assert_eq!(
+        file.read_at_into(4096, &mut buf)
+            .await
+            .expect("refill after enabling"),
+        4096
+    );
+    assert_eq!(buf, [0x5a; 4096]);
+    file.background_refill_range(&background_source, 3 * 4096, 2, 1)
+        .await
+        .expect("background refill after enabling");
+    assert_eq!(backend.stats().bytes_used, 3 * 4096);
+    assert_eq!(file.query(4096, 2 * 4096).await.expect("cached blocks"), 0);
+}
+
+#[tokio::test]
 async fn test_overlaybd_watermark_formula_alignment() {
     let tmp = tempdir().expect("create tempdir");
     let cap = 4 * GIB;
@@ -2085,6 +2682,9 @@ async fn test_cached_fs_facade_open_access_rename_and_unlink() {
     let got = cached.read_at(0, 4096).await.expect("cached read");
     assert_eq!(got.as_ref(), &payload[..4096]);
     assert!(backend.contains_src_name("/dir/file"));
+    // Release the read permit held by the cached read result before the
+    // entry is renamed and evicted below.
+    drop(got);
     drop(cached);
 
     cached_fs
@@ -2114,6 +2714,9 @@ async fn test_cached_fs_facade_open_access_rename_and_unlink() {
         .await
         .expect("read renamed cache");
     assert_eq!(got.as_ref(), &payload[..4096]);
+    // The read result holds a read permit on the entry's barrier; release it
+    // before the entry is evicted below.
+    drop(got);
     drop(cache_only);
 
     cached_fs
@@ -2261,6 +2864,9 @@ async fn test_cached_file_evict_does_not_forward_to_source() {
 
     let got = file.read_at(0, payload.len()).await.expect("fill cache");
     assert_eq!(got.as_ref(), payload.as_slice());
+    // The read result holds a read permit on the entry's barrier; release it
+    // before evicting below.
+    drop(got);
 
     file.evict_range(0, 4096).await.expect("evict range");
     file.evict_all().await.expect("evict all");
@@ -2755,5 +3361,203 @@ async fn test_failed_foreground_refill_leaves_no_reserved_blocks() {
             .blocks(),
         0,
         "failed refill must leave the data file fully sparse"
+    );
+}
+
+#[tokio::test]
+async fn test_read_falls_back_to_source_while_eviction_holds_write_lock() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut opt = test_options(tmp.path());
+    opt.block_size = 4096;
+    let backend = FileCacheBackend::with_options(opt).await.expect("backend");
+
+    let payload = uniform_char_random_data(4096, 0xdada);
+    let src = Arc::new(MockSource::new(payload.clone(), Duration::ZERO));
+    let file = backend
+        .open_file("guarded", src.clone())
+        .await
+        .expect("open");
+    let first = file.read_at(0, 4096).await.expect("fill");
+    assert_eq!(first.as_ref(), payload.as_slice());
+    assert_eq!(src.read_calls(), 1);
+    // The cached read holds a read permit on the barrier for its whole
+    // lifetime; release it before taking the write side below.
+    drop(first);
+
+    // 驱逐者持有写许可期间,读必须不阻塞并回源兜底(refill 与 read_block
+    // 的 try_read 都失败,按 miss 处理)。
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("guarded"))
+        .expect("entry");
+    let _write = entry.refill_eviction_barrier.write().await;
+    let served = tokio::time::timeout(Duration::from_secs(5), file.read_at(0, 4096))
+        .await
+        .expect("read must not block behind eviction")
+        .expect("read under eviction");
+    assert_eq!(served.as_ref(), payload.as_slice());
+    assert_eq!(src.read_calls(), 2, "read must fall back to the source");
+    drop(_write);
+}
+
+#[tokio::test]
+async fn test_concurrent_reads_survive_open_entry_block_eviction() {
+    const BLOCK: usize = 4096;
+    const READERS: usize = 8;
+    const ITERS: usize = 500;
+
+    let tmp = tempdir().expect("create tempdir");
+    let mut opt = test_options(tmp.path());
+    opt.capacity_bytes = 1024 * 1024;
+    opt.block_size = BLOCK as u64;
+    let backend = FileCacheBackend::with_options(opt).await.expect("backend");
+
+    let payload = Arc::new(uniform_char_random_data(BLOCK, 0xc0de));
+    let src = Arc::new(MockSource::new(payload.to_vec(), Duration::ZERO));
+    let file = backend.open_file("hot", src).await.expect("open");
+    let _ = file.read_at(0, BLOCK).await.expect("fill");
+
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("hot"))
+        .expect("entry");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let evictor = {
+        let entry = entry.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = entry.evict_all_blocks().await;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    let mut handles = Vec::new();
+    for _ in 0..READERS {
+        let file = file.clone();
+        let payload = payload.clone();
+        let stop = stop.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..ITERS {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let got = file.read_at(0, BLOCK).await.expect("read");
+                assert_eq!(
+                    got.as_ref(),
+                    payload.as_slice(),
+                    "reader observed corrupted data (eviction raced a zero-copy read)"
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("reader panicked");
+    }
+    stop.store(true, Ordering::Relaxed);
+    evictor.await.expect("evictor panicked");
+}
+
+#[tokio::test]
+async fn test_idle_open_entries_are_block_evicted_under_pressure() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut opt = test_options(tmp.path());
+    opt.capacity_bytes = 6 * 1024;
+    opt.block_size = 4096;
+    opt.open_evict_idle = std::time::Duration::from_secs(60);
+    let backend = FileCacheBackend::with_options(opt).await.expect("backend");
+
+    let payload_a = uniform_char_random_data(4096, 0xaaa1);
+    let payload_b = uniform_char_random_data(4096, 0xbbb2);
+    let src_a = Arc::new(MockSource::new(payload_a.clone(), Duration::ZERO));
+    let src_b = Arc::new(MockSource::new(payload_b.clone(), Duration::ZERO));
+
+    // A、B 各钉住一个块并保持句柄打开(模拟长存活 sandbox)。
+    let file_a = backend
+        .open_file("open-a", src_a.clone())
+        .await
+        .expect("open a");
+    let file_b = backend
+        .open_file("open-b", src_b.clone())
+        .await
+        .expect("open b");
+    let _ = file_a.read_at(0, 4096).await.expect("fill a");
+    let _ = file_b.read_at(0, 4096).await.expect("fill b");
+    assert_eq!(src_a.read_calls(), 1);
+    assert_eq!(src_b.read_calls(), 1);
+
+    // 把 A 的 last_access 老化到阈值之外;B 保持新鲜。
+    let id_a = super::cache_key_digest("open-a");
+    backend
+        .get_cache_entry(&id_a)
+        .expect("entry a")
+        .last_access_nanos
+        .store(0, Ordering::Relaxed);
+
+    // 新模板 C:refill 触发压力驱逐,A 的 idle 块被回收,B(活跃)不受影响。
+    let payload_c = uniform_char_random_data(4096, 0xccc3);
+    let src_c = Arc::new(MockSource::new(payload_c.clone(), Duration::ZERO));
+    let file_c = backend
+        .open_file("open-c", src_c.clone())
+        .await
+        .expect("open c");
+    let got_c = file_c.read_at(0, 4096).await.expect("fill c");
+    assert_eq!(got_c.as_ref(), payload_c.as_slice());
+    assert_eq!(src_c.read_calls(), 1);
+
+    // 缓存满的情况下 C 仍然 populate 了自己的 entry。
+    let c_stats = backend.file_stats("open-c").expect("stats for c");
+    assert_eq!(c_stats.bytes_used, 4096);
+    // B 的块保留;A 的块被回收但 entry 存活。
+    let b_stats = backend.file_stats("open-b").expect("stats for b");
+    assert_eq!(b_stats.bytes_used, 4096);
+    let a_stats = backend.file_stats("open-a").expect("stats for a");
+    assert_eq!(a_stats.bytes_used, 0);
+
+    // A 再次读取时正常 refill,数据正确。
+    let reread = file_a.read_at(0, 4096).await.expect("reread a");
+    assert_eq!(reread.as_ref(), payload_a.as_slice());
+    assert_eq!(src_a.read_calls(), 2);
+}
+
+#[tokio::test]
+async fn test_concurrent_uncached_reads_fetch_source_once() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut opt = test_options(tmp.path());
+    opt.capacity_bytes = 4 * 4096;
+    opt.block_size = 4096;
+    let backend = FileCacheBackend::with_options(opt).await.expect("backend");
+
+    // 用一个保持打开的 filler entry 把缓存池真正钉满(open 且 last_access
+    // 新鲜,二层驱逐不会动它),使 is_full 在整个测试期间保持置位。
+    let filler_payload = uniform_char_random_data(4 * 4096, 0x1eaf);
+    let filler_src = Arc::new(MockSource::new(filler_payload, Duration::ZERO));
+    let filler = backend
+        .open_file("filler", filler_src)
+        .await
+        .expect("open filler");
+    let _ = filler.read_at(0, 4 * 4096).await.expect("fill pool");
+
+    let payload = uniform_char_random_data(4096, 0xfeed);
+    // 50ms 源延迟保证 8 个读者的回源窗口重叠。
+    let src = Arc::new(MockSource::new(payload.clone(), Duration::from_millis(50)));
+    let file = backend.open_file("dedup", src.clone()).await.expect("open");
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let file = file.clone();
+        let payload = payload.clone();
+        handles.push(tokio::spawn(async move {
+            let got = file.read_at(0, 4096).await.expect("read");
+            assert_eq!(got.as_ref(), payload.as_slice());
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("reader task");
+    }
+    assert_eq!(
+        src.read_calls(),
+        1,
+        "concurrent readers must share one source fetch"
     );
 }

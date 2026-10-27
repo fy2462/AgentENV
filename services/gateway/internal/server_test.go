@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,8 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type stubSchedulerClient struct {
@@ -248,6 +251,20 @@ func TestGatewayRequiresExactAPIKey(t *testing.T) {
 	}
 }
 
+func TestV2TemplateBuildRequiresAPIKeyWithProxyHeaders(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	req := httptest.NewRequest(http.MethodPost, "/v2/templates/build-123/builds/build-123", strings.NewReader(`{}`))
+	req.Header.Set(headerE2BSandboxID, "unrelated-sandbox")
+	req.Header.Set(headerE2BTargetPort, "49983")
+	recorder := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+}
+
 func TestGatewayMetricsPathDoesNotRequireAPIKey(t *testing.T) {
 	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
 	recorder := httptest.NewRecorder()
@@ -406,62 +423,6 @@ func TestHasProxyRoutingHeaders(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := hasProxyRoutingHeaders(tc.headers); got != tc.want {
 				t.Fatalf("hasProxyRoutingHeaders() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestSandboxIDFromPath(t *testing.T) {
-	tests := []struct {
-		name string
-		path string
-		want string
-		ok   bool
-	}{
-		{name: "base sandbox path", path: "/sandboxes/sbx-123", want: "sbx-123", ok: true},
-		{name: "sandbox pause path", path: "/sandboxes/sbx-123/pause", want: "sbx-123", ok: true},
-		{name: "sandbox timeout path", path: "/sandboxes/sbx-123/timeout", want: "sbx-123", ok: true},
-		{name: "sandbox list path", path: "/sandboxes", ok: false},
-		{name: "cold sandbox create path", path: "/sandboxes-cold", ok: false},
-		{name: "v2 sandbox list path", path: "/v2/sandboxes", ok: false},
-		{name: "other resource", path: "/templates/abc", ok: false},
-		{name: "empty segment", path: "/sandboxes//pause", ok: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := sandboxIDFromPath(tc.path)
-			if ok != tc.ok || got != tc.want {
-				t.Fatalf("path %q expected (%q, %v), got (%q, %v)", tc.path, tc.want, tc.ok, got, ok)
-			}
-		})
-	}
-}
-
-func TestIsSandboxControlPlaneRequest(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-		path   string
-		want   bool
-	}{
-		{name: "sandbox detail", method: http.MethodGet, path: "/sandboxes/sbx-123", want: true},
-		{name: "sandbox delete", method: http.MethodDelete, path: "/sandboxes/sbx-123", want: true},
-		{name: "sandbox pause", method: http.MethodPost, path: "/sandboxes/sbx-123/pause", want: true},
-		{name: "sandbox fork", method: http.MethodPost, path: "/sandboxes/sbx-123/fork", want: true},
-		{name: "sandbox network update", method: http.MethodPut, path: "/sandboxes/sbx-123/network", want: true},
-		{name: "network update wrong method", method: http.MethodPost, path: "/sandboxes/sbx-123/network", want: false},
-		{name: "sandbox custom extension params get", method: http.MethodGet, path: "/sandboxes/sbx-123/custom-extension-params", want: true},
-		{name: "sandbox custom extension params patch", method: http.MethodPatch, path: "/sandboxes/sbx-123/custom-extension-params", want: true},
-		{name: "sandbox custom extension params post", method: http.MethodPost, path: "/sandboxes/sbx-123/custom-extension-params", want: false},
-		{name: "data-plane shaped path", method: http.MethodGet, path: "/sandboxes/sbx-123/files", want: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			request := httptest.NewRequest(tc.method, "http://gateway.test"+tc.path, nil)
-			if got := isSandboxControlPlaneRequest(request); got != tc.want {
-				t.Fatalf("isSandboxControlPlaneRequest(%s %s) = %v, want %v", tc.method, tc.path, got, tc.want)
 			}
 		})
 	}
@@ -675,7 +636,8 @@ func TestSandboxIDExtractionPathPreferredOverHeader(t *testing.T) {
 	h := http.Header{}
 	h.Set("x-agentenv-sandbox-id", "from-header")
 
-	id, ok := sandboxIDFromPath("/sandboxes/from-path/pause")
+	route, ok := matchPathRoute(http.MethodPost, "/sandboxes/from-path/pause")
+	id := route.id
 	if !ok {
 		id, ok = sandboxIDFromHeaders(h)
 	}
@@ -686,64 +648,68 @@ func TestSandboxIDExtractionPathPreferredOverHeader(t *testing.T) {
 }
 
 func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
-	type upstreamRequestSnapshot struct {
-		path      string
-		sandboxID string
-	}
-
-	requests := make(chan upstreamRequestSnapshot, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- upstreamRequestSnapshot{
-			path:      r.URL.Path,
-			sandboxID: r.Header.Get(headerE2BSandboxID),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"sandboxID":"sbx-path"}`))
-	}))
-	defer upstream.Close()
-
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-path" {
-				return nil, fmt.Errorf("lookup sandbox id = %q, want %q", req.GetSandboxId(), "sbx-path")
+	for _, path := range []string{"/sandboxes/sbx-path/connect", "/v2/sandboxes/sbx-path/connect"} {
+		t.Run(path, func(t *testing.T) {
+			type upstreamRequestSnapshot struct {
+				path      string
+				sandboxID string
 			}
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{
-					NodeId:   "node-1",
-					Endpoint: upstream.URL,
+
+			requests := make(chan upstreamRequestSnapshot, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests <- upstreamRequestSnapshot{
+					path:      r.URL.Path,
+					sandboxID: r.Header.Get(headerE2BSandboxID),
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"sandboxID":"sbx-path"}`))
+			}))
+			defer upstream.Close()
+
+			server := newTestServer(t, stubSchedulerClient{
+				lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+					if req.GetSandboxId() != "sbx-path" {
+						return nil, fmt.Errorf("lookup sandbox id = %q, want %q", req.GetSandboxId(), "sbx-path")
+					}
+					return &schedulerv1.LookupNodeResponse{
+						Node: &schedulerv1.Node{
+							NodeId:   "node-1",
+							Endpoint: upstream.URL,
+						},
+					}, nil
 				},
-			}, nil
-		},
-	}, time.Second, 1024)
+			}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
-	defer gatewayServer.Close()
+			gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+			defer gatewayServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes/sbx-path/connect", strings.NewReader(`{"timeout":60}`))
-	if err != nil {
-		t.Fatalf("build connect request failed: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(headerE2BSandboxID, "sbx-path")
-	req.Header.Set(headerE2BTargetPort, "49983")
+			req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+path, strings.NewReader(`{"timeout":60}`))
+			if err != nil {
+				t.Fatalf("build connect request failed: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(headerE2BSandboxID, "sbx-path")
+			req.Header.Set(headerE2BTargetPort, "49983")
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("connect request failed: %v", err)
-	}
-	defer resp.Body.Close()
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("connect request failed: %v", err)
+			}
+			defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("connect status = %d, want %d", resp.StatusCode, http.StatusCreated)
-	}
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("connect status = %d, want %d", resp.StatusCode, http.StatusCreated)
+			}
 
-	upstreamReq := <-requests
-	if upstreamReq.path != "/sandboxes/sbx-path/connect" {
-		t.Fatalf("upstream path = %q, want %q", upstreamReq.path, "/sandboxes/sbx-path/connect")
-	}
-	if upstreamReq.sandboxID != "sbx-path" {
-		t.Fatalf("forwarded e2b sandbox id = %q, want %q", upstreamReq.sandboxID, "sbx-path")
+			upstreamReq := <-requests
+			if upstreamReq.path != path {
+				t.Fatalf("upstream path = %q, want %q", upstreamReq.path, path)
+			}
+			if upstreamReq.sandboxID != "sbx-path" {
+				t.Fatalf("forwarded e2b sandbox id = %q, want %q", upstreamReq.sandboxID, "sbx-path")
+			}
+		})
 	}
 }
 
@@ -758,6 +724,8 @@ func TestShouldRecordAssignment(t *testing.T) {
 	}{
 		{name: "create sandbox", method: http.MethodPost, path: "/sandboxes", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "create sandbox with trailing slash", method: http.MethodPost, path: "/sandboxes/", route: routeSourceSchedule, hasSandbox: false, want: true},
+		{name: "create v2 sandbox", method: http.MethodPost, path: "/v2/sandboxes", route: routeSourceSchedule, hasSandbox: false, want: true},
+		{name: "create v2 sandbox with trailing slash", method: http.MethodPost, path: "/v2/sandboxes/", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "create cold sandbox", method: http.MethodPost, path: "/sandboxes-cold", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "create cold sandbox with trailing slash", method: http.MethodPost, path: "/sandboxes-cold/", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "fork sandbox records child assignment", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourcePath, hasSandbox: true, want: true},
@@ -927,19 +895,21 @@ func mustListedSandbox(id string, startedAt string, state string, envdVersion st
 	if err != nil {
 		panic(err)
 	}
-	return listedSandbox{
-		TemplateID:  "template",
-		SandboxID:   id,
-		ClientID:    "client",
-		StartedAt:   parsed.UTC(),
-		EndAt:       parsed.UTC().Add(time.Hour),
-		CPUCount:    1,
-		MemoryMB:    128,
-		DiskSizeMB:  0,
-		Metadata:    map[string]string{"team": "alpha"},
-		State:       state,
-		EnvdVersion: envdVersion,
+	payload, err := json.Marshal(map[string]any{
+		"sandboxID":   id,
+		"startedAt":   parsed.UTC(),
+		"state":       state,
+		"envdVersion": envdVersion,
+	})
+	if err != nil {
+		panic(err)
 	}
+
+	var item listedSandbox
+	if err := json.Unmarshal(payload, &item); err != nil {
+		panic(err)
+	}
+	return item
 }
 
 func decodeListedSandboxResponse(t *testing.T, body io.Reader) []listedSandbox {
@@ -954,7 +924,7 @@ func decodeListedSandboxResponse(t *testing.T, body io.Reader) []listedSandbox {
 func sandboxIDs(items []listedSandbox) []string {
 	ids := make([]string, 0, len(items))
 	for _, item := range items {
-		ids = append(ids, item.SandboxID)
+		ids = append(ids, item.sandboxID)
 	}
 	return ids
 }
@@ -1044,6 +1014,54 @@ func TestHandleProxyAggregatesSandboxListAcrossNodes(t *testing.T) {
 		if upstreamReq.forwardedURI != "/sandboxes?metadata=team%3Dalpha" {
 			t.Fatalf("X-Forwarded-URI = %q, want %q", upstreamReq.forwardedURI, "/sandboxes?metadata=team%3Dalpha")
 		}
+	}
+}
+
+func TestHandleProxyClusterListPreservesNodeFields(t *testing.T) {
+	const upstreamBody = `[{"templateID":"template","sandboxID":"00000000-0000-0000-0000-000000000001","startedAt":"2026-01-01T00:00:01Z","state":"running","volumeMounts":[{"name":"workspace","path":"/mnt/data"}],"futureField":{"nested":[1,true,"value"]}}]`
+
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer node.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		listNodesFunc: func(_ context.Context, _ *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+			return &schedulerv1.ListNodesResponse{
+				Nodes: []*schedulerv1.Node{{NodeId: "node-a", Endpoint: node.URL}},
+			}, nil
+		},
+	}, time.Second, 1024)
+
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+	defer gatewayServer.Close()
+
+	var want any
+	if err := json.Unmarshal([]byte(upstreamBody), &want); err != nil {
+		t.Fatalf("decode expected response failed: %v", err)
+	}
+
+	for _, path := range []string{"/sandboxes", "/v2/sandboxes?limit=10"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(gatewayServer.URL + path)
+			if err != nil {
+				t.Fatalf("cluster list request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+
+			var got any
+			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatalf("decode cluster list response failed: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("cluster list response = %#v, want %#v", got, want)
+			}
+		})
 	}
 }
 
@@ -1302,8 +1320,14 @@ func TestHandleProxyAggregatesSandboxListDedupsDuplicateSandboxIDs(t *testing.T)
 	if len(items) != 1 {
 		t.Fatalf("expected 1 sandbox after dedupe, got %d", len(items))
 	}
-	if items[0].EnvdVersion != "envd-new" {
-		t.Fatalf("deduped sandbox envdVersion = %q, want %q", items[0].EnvdVersion, "envd-new")
+	var payload struct {
+		EnvdVersion string `json:"envdVersion"`
+	}
+	if err := json.Unmarshal(items[0].payload, &payload); err != nil {
+		t.Fatalf("decode deduped sandbox failed: %v", err)
+	}
+	if payload.EnvdVersion != "envd-new" {
+		t.Fatalf("deduped sandbox envdVersion = %q, want %q", payload.EnvdVersion, "envd-new")
 	}
 }
 
@@ -1557,6 +1581,132 @@ func TestInjectForwardedHeadersSetsXForwardedFor(t *testing.T) {
 	}
 }
 
+func TestTemplateBuildAllocationRequiresRoutingBinding(t *testing.T) {
+	for _, buildID := range []string{"build-123", "", "other-build"} {
+		t.Run(fmt.Sprintf("build ID %q", buildID), func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("x-agentenv-build-id", buildID)
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer upstream.Close()
+			server := newTestServer(t, stubSchedulerClient{
+				scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+					return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "builder", Endpoint: upstream.URL}}, nil
+				},
+				recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+					if buildID != "build-123" {
+						t.Error("attempted to bind an absent or mismatched build ID")
+					}
+					return nil, status.Error(codes.Unavailable, "scheduler unavailable")
+				},
+			}, time.Second, 1024)
+			response := httptest.NewRecorder()
+			authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/templates/build-123/builds/build-123/builder", strings.NewReader(`{}`)))
+			want := http.StatusServiceUnavailable
+			if buildID != "build-123" {
+				want = http.StatusBadGateway
+			}
+			if response.Code != want {
+				t.Fatalf("got %d: %s, want %d", response.Code, response.Body.String(), want)
+			}
+		})
+	}
+}
+
+func TestTemplateBuilderRoutingAndAssignment(t *testing.T) {
+	requests := make(chan string, 4)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Path
+		if r.Method == http.MethodPut {
+			w.Header().Set("x-agentenv-build-id", "build-123")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"imageName":"aenv-build:build-123"}`))
+		}
+	}))
+	defer upstream.Close()
+	node := &schedulerv1.Node{NodeId: "builder-node", Endpoint: upstream.URL}
+	recorded := make(chan string, 1)
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			return &schedulerv1.ScheduleResponse{Node: node}, nil
+		},
+		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			if req.GetSandboxId() != "build-123" {
+				return nil, fmt.Errorf("unexpected build binding: %s", req.GetSandboxId())
+			}
+			return &schedulerv1.LookupNodeResponse{Node: node}, nil
+		},
+		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			recorded <- req.GetSandboxId()
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}, time.Second, 1024)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPut, "/templates/build-123/builds/build-123/builder"},
+		{http.MethodGet, "/templates/build-123/builds/build-123/builder"},
+		{http.MethodGet, "/templates/build-123/builds/build-123/status"},
+		{http.MethodGet, "/templates/build-123/builds/build-123/logs"},
+		{http.MethodDelete, "/templates/build-123/builds/build-123/builder"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`))
+		req.Header.Set(headerSandboxID, "unrelated-sandbox")
+		req.Header.Set(headerTargetPort, "1234")
+		if server.isSandboxDataPlaneRequest(req) {
+			t.Fatal("template builder must require API authentication")
+		}
+		response := httptest.NewRecorder()
+		authenticatedTestHandler(server).ServeHTTP(response, req)
+		if response.Code >= 400 {
+			t.Fatalf("%s %s: %d %s", tc.method, tc.path, response.Code, response.Body.String())
+		}
+		if got := <-requests; got != tc.path {
+			t.Fatalf("forwarded path %s, want %s", got, tc.path)
+		}
+	}
+	if got := <-recorded; got != "build-123" {
+		t.Fatalf("recorded build %s", got)
+	}
+}
+
+func TestTemplateBuildStatusFallsBackOnlyForMissingBindings(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	for _, tc := range []struct {
+		name         string
+		resource     string
+		lookupCode   codes.Code
+		wantStatus   int
+		wantSchedule bool
+	}{
+		{"finished build", "status", codes.NotFound, http.StatusOK, true},
+		{"finished build logs", "logs", codes.NotFound, http.StatusOK, true},
+		{"logs scheduler unavailable", "logs", codes.Unavailable, http.StatusServiceUnavailable, false},
+		{"scheduler unavailable", "status", codes.Unavailable, http.StatusServiceUnavailable, false},
+		{"missing builder", "builder", codes.NotFound, http.StatusNotFound, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheduled := false
+			server := newTestServer(t, stubSchedulerClient{
+				lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+					return nil, status.Error(tc.lookupCode, "lookup failed")
+				},
+				scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+					scheduled = true
+					return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "repository-node", Endpoint: upstream.URL}}, nil
+				},
+			}, time.Second, 1024)
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/templates/template-123/builds/build-123/"+tc.resource, nil)
+			authenticatedTestHandler(server).ServeHTTP(response, request)
+			if response.Code != tc.wantStatus || scheduled != tc.wantSchedule {
+				t.Fatalf("status=%d scheduled=%t, want status=%d scheduled=%t", response.Code, scheduled, tc.wantStatus, tc.wantSchedule)
+			}
+		})
+	}
+}
+
 func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) {
 	readInvoked := false
 	bodyClosed := false
@@ -1577,7 +1727,7 @@ func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) 
 	resp.Header.Set(headerSandboxID, "sbx-from-header")
 
 	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
-	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, "/sandboxes/sbx-from-header"); err != nil {
+	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, http.MethodPost, "/sandboxes/sbx-from-header"); err != nil {
 		t.Fatalf("recordAssignmentFromResponse returned error: %v", err)
 	}
 
@@ -2501,5 +2651,33 @@ func TestGatewayClassifiesClientCanceledProxyErrors(t *testing.T) {
 	getReq := httptest.NewRequest(http.MethodGet, "/process.Process/StreamInput", nil)
 	if isStreamInputProxyRequest(getReq) {
 		t.Fatalf("GET StreamInput should not be classified as stream input")
+	}
+}
+
+func TestV2TemplateBuildBindsFromPathWithoutResponseHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer upstream.Close()
+	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 1)
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "builder", Endpoint: upstream.URL}}, nil
+		},
+		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			recorded <- req
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}, time.Second, 1024)
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v2/templates/build-123/builds/build-123", strings.NewReader(`{}`)))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("got %d: %s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("x-agentenv-build-id") != "" {
+		t.Fatal("unexpected build routing header")
+	}
+	if got := (<-recorded).GetSandboxId(); got != "build-123" {
+		t.Fatalf("recorded build %q, want build-123", got)
 	}
 }

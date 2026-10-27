@@ -1,16 +1,29 @@
-mod artifact_cache;
+pub(crate) mod artifact_cache;
+pub mod backends;
+mod catalog;
 pub mod image_export;
 mod manager;
 #[doc(hidden)]
 pub mod mock;
-mod p2p;
-pub mod repository;
+pub(crate) mod p2p;
+pub(crate) mod publish;
+pub(crate) mod recontainerize;
+pub(crate) mod resolver;
 pub(crate) mod runtime_support;
+pub(crate) mod startup_pack;
+pub(crate) mod store;
 mod types;
 
+pub use catalog::{SnapshotCatalog, SnapshotListFilter};
 pub use manager::SnapshotManager;
-pub use repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
-pub(crate) use types::rootfs_snapshot_image_tag;
+pub use publish::SnapshotPublication;
+pub use resolver::SnapshotRuntimeResolver;
+pub use startup_pack::{
+    drain_startup_manifest_tasks, MemoryStartupPackInfo, ResolvedStartupPack,
+    ResolvedStartupPackSource, StartupRecording, MEMORY_STARTUP_PACK_ARTIFACT,
+    MEMORY_STARTUP_TRACE_ARTIFACT,
+};
+pub(crate) use types::{rootfs_snapshot_image_tag, RuntimeArtifactLease};
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,
     OverlaybdLayerRef, PersistedDiskImagePublication, ResolvedAttachedDrive, RunnableSnapshot,
@@ -18,3 +31,4 @@ pub use types::{
     SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand,
     TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
 };
+pub use types::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};

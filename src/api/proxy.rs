@@ -37,11 +37,11 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     api::{impls::auth::TRAFFIC_ACCESS_TOKEN_HEADER, ApiImpl},
     cfg::ConfigManager,
-    observability::prometheus::HttpRouteSource,
     orchestrator::{
         NewTimeout, OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxMetadata,
         SandboxState,
     },
+    prometheus::HttpRouteSource,
     types::SandboxId,
 };
 
@@ -96,9 +96,14 @@ const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
-const PROXY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_millis(100);
+const PROXY_HTTP_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
-const PROXY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const PROXY_HTTP_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[cfg(test)]
+const PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -476,7 +481,7 @@ async fn proxy_http_request(
                 method = %upstream_method,
                 upstream = %upstream_uri_for_log,
                 request_body_idle_timeout_ms = PROXY_REQUEST_BODY_IDLE_TIMEOUT.as_millis(),
-                response_header_timeout_ms = PROXY_RESPONSE_HEADER_TIMEOUT.as_millis(),
+                response_header_timeout_ms = PROXY_HTTP_RESPONSE_HEADER_TIMEOUT.as_millis(),
                 "timed out waiting for upstream response headers or request body progress"
             );
             return StatusCode::GATEWAY_TIMEOUT.into_response();
@@ -552,7 +557,7 @@ where
                     timer.as_mut().reset(tokio::time::Instant::now() + PROXY_REQUEST_BODY_IDLE_TIMEOUT);
                 } else {
                     activity_open = false;
-                    timer.as_mut().reset(tokio::time::Instant::now() + PROXY_RESPONSE_HEADER_TIMEOUT);
+                    timer.as_mut().reset(tokio::time::Instant::now() + PROXY_HTTP_RESPONSE_HEADER_TIMEOUT);
                 }
             }
         }
@@ -631,7 +636,7 @@ async fn proxy_websocket_request(
     );
 
     let (upstream_websocket, upstream_response) = match timeout(
-        PROXY_RESPONSE_HEADER_TIMEOUT,
+        PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT,
         connect_async(upstream_request),
     )
     .await
@@ -650,7 +655,7 @@ async fn proxy_websocket_request(
         Err(_) => {
             warn!(
                 sandbox_id = %sandbox_id,
-                timeout_ms = PROXY_RESPONSE_HEADER_TIMEOUT.as_millis(),
+                timeout_ms = PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT.as_millis(),
                 "timed out waiting for upstream websocket handshake"
             );
             return StatusCode::GATEWAY_TIMEOUT.into_response();
@@ -1612,6 +1617,99 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    async fn buildkit_control_endpoints_require_api_auth_and_validate_input() {
+        let api = build_api().await;
+        let app = server::new(api);
+        let tunnel = "/templates/invalid/builds/invalid/builder".to_string();
+        assert_eq!(
+            get_status(&app, &tunnel, &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(&app, &tunnel, &[(TRAFFIC_ACCESS_TOKEN_HEADER, "invalid")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let body = json!({});
+        for (key, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("incorrect"), StatusCode::UNAUTHORIZED),
+            (Some(TEST_API_KEY), StatusCode::NOT_FOUND),
+        ] {
+            let mut request = http::Request::builder()
+                .method("PUT")
+                .uri(&tunnel)
+                .header("host", "localhost")
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                request = request.header(API_KEY_HEADER, key);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let body = json!({"timeout": 0});
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri(tunnel)
+                    .header("host", "localhost")
+                    .header("content-type", "application/json")
+                    .header(API_KEY_HEADER, TEST_API_KEY)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn buildkit_workers_are_hidden_with_encoded_control_path_ids() {
+        let api = build_api().await;
+        let id = SandboxId::new();
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                crate::orchestrator::SandboxState::Running,
+            )
+            .await;
+        api.orchestrator()
+            .set_template_builder_for_test(&id)
+            .await
+            .unwrap();
+        let app = server::new(api.clone());
+        let encoded = id
+            .to_string()
+            .bytes()
+            .map(|byte| format!("%{byte:02X}"))
+            .collect::<String>();
+        for path_id in [id.to_string(), encoded] {
+            for method in ["GET", "DELETE"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        http::Request::builder()
+                            .method(method)
+                            .uri(format!("/sandboxes/{path_id}"))
+                            .header("host", "localhost")
+                            .header(API_KEY_HEADER, TEST_API_KEY)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                assert!(api.orchestrator().get_sandbox(&id).await.unwrap().is_some());
+            }
+        }
+    }
+
     async fn build_api() -> Arc<ApiImpl> {
         build_api_with_sandbox_proxy_domains(Vec::new()).await
     }
@@ -1631,7 +1729,8 @@ mod tests {
         .unwrap();
         let snapshot_manager = Arc::new(mock_snapshot_manager());
         let template_builder = Arc::new(TemplateBuilder::new());
-        let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
+        let image_resolver = ImageResolver::new(&AppConfig::default())
+            .with_repository(snapshot_manager.repository());
         let volume_manager = Arc::new(
             crate::volume::VolumeManager::open_with_repository(
                 root.path().join("volumes/catalog.json"),
@@ -1644,7 +1743,7 @@ mod tests {
             orchestrator,
             snapshot_manager,
             template_builder,
-            image_resolver,
+            Arc::new(image_resolver),
             volume_manager,
             None,
             domains,
@@ -1880,6 +1979,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_logs_http_contract_validates_auth_and_query() {
+        let api = build_api().await;
+        let app = server::new(api.clone());
+        let id = SandboxId::new();
+        let path = format!("/v2/sandboxes/{id}/logs");
+        let auth = [(API_KEY_HEADER, TEST_API_KEY)];
+        assert_eq!(get_status(&app, &path, &[]).await, StatusCode::UNAUTHORIZED);
+        for suffix in [
+            "?limit=-1",
+            "?limit=1001",
+            "?cursor=-1",
+            "?cursor=9223372036854775808",
+            "?direction=sideways",
+            "?level=fatal",
+            &format!("?search={}", "x".repeat(257)),
+        ] {
+            assert_eq!(
+                get_status(&app, &format!("{path}{suffix}"), &auth).await,
+                StatusCode::BAD_REQUEST,
+                "{suffix}"
+            );
+        }
+        for suffix in [
+            "",
+            "?limit=0",
+            "?limit=1000",
+            "?cursor=9223372036854775807",
+            "?direction=forward&level=warn&search=Hello",
+        ] {
+            assert_eq!(
+                get_status(&app, &format!("{path}{suffix}"), &auth).await,
+                StatusCode::NOT_FOUND,
+                "{suffix}"
+            );
+        }
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                crate::orchestrator::SandboxState::Paused,
+            )
+            .await;
+        for suffix in ["", "?limit=0"] {
+            assert_eq!(
+                get_status(&app, &format!("{path}{suffix}"), &auth).await,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "paused sandboxes cannot serve guest logs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_metrics_http_contract_auth_csv_and_time_validation() {
+        let app = server::new(build_api().await);
+        let a = SandboxId::new();
+        let b = SandboxId::new();
+        let auth = [(API_KEY_HEADER, TEST_API_KEY)];
+        for (uri, expected) in [
+            (
+                format!("/sandboxes/metrics?sandbox_ids={a},{b}"),
+                StatusCode::OK,
+            ),
+            ("/sandboxes/metrics".into(), StatusCode::BAD_REQUEST),
+            (
+                "/sandboxes/metrics?sandbox_ids=".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/sandboxes/metrics?sandbox_ids=not-a-uuid".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/metrics?sandbox_ids={a},not-a-uuid"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/metrics?sandbox_ids={a},{a}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/metrics?sandbox_ids={a}&sandbox_ids={b}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (format!("/sandboxes/{a}/metrics"), StatusCode::NOT_FOUND),
+            (
+                format!("/sandboxes/{a}/metrics?start=-1"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/{a}/metrics?start=2&end=1"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/{a}/metrics?end=18446744073709551615"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            assert_eq!(get_status(&app, &uri, &auth).await, expected, "{uri}");
+        }
+        assert_eq!(
+            get_status(&app, &format!("/sandboxes/{a}/metrics"), &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(&app, &format!("/sandboxes/metrics?sandbox_ids={a}"), &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let response = control_plane_request(
+            &app,
+            Method::GET,
+            format!("/sandboxes/metrics?sandbox_ids={a},{b}"),
+            Body::empty(),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"sandboxes": {}})
+        );
+    }
+
+    #[tokio::test]
     async fn control_plane_auth_is_separate_from_sandbox_auth() {
         let app = server::new(build_api().await);
 
@@ -1948,22 +2171,15 @@ mod tests {
     }
 
     #[test]
-    fn e2b_volume_mounts_use_a_path_to_volume_map() {
+    fn volume_mounts_use_name_and_path_entries() {
         let request: agentenv_http_server::models::NewSandbox = serde_json::from_value(json!({
-            "templateID": "template",
-            "volumeMounts": {"/mnt/data": "vol_123"}
-        }))
-        .expect("E2B volumeMounts map should deserialize");
-        assert_eq!(
-            request.volume_mounts.unwrap().get("/mnt/data"),
-            Some(&"vol_123".to_string())
-        );
-
-        serde_json::from_value::<agentenv_http_server::models::NewSandbox>(json!({
             "templateID": "template",
             "volumeMounts": [{"name": "vol_123", "path": "/mnt/data"}]
         }))
-        .expect_err("array form is not the issue 211 API");
+        .expect("volumeMounts array should deserialize");
+        let mount = &request.volume_mounts.unwrap()[0];
+        assert_eq!(mount.name, "vol_123");
+        assert_eq!(mount.path, "/mnt/data");
     }
 
     #[tokio::test]

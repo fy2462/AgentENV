@@ -7,14 +7,15 @@ use overlaybd::config::UpperMode;
 use shell_util::shell_quote;
 use tempfile::TempDir;
 use tokio::time::Instant;
-use tracing::{debug, warn, Span};
+use tracing::{debug, info, warn, Span};
 
 use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
 use super::step_executor::TemplateStepExecutor;
+use crate::cfg::ConfigManager;
 use crate::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest, ProcessHandle,
-    ProcessOpts, SandboxExecutor, SandboxLaunchConfig, UblkConfig,
+    FirecrackerSandbox, FirecrackerSandboxConfig, ProcessHandle, ProcessOpts, SandboxBackend,
+    SandboxExecutor, SandboxLaunchConfig, SandboxSnapshotManifest, UblkConfig,
 };
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
@@ -25,7 +26,7 @@ use crate::virtualization::VirtualizationMode;
 
 /// Default command to use for ready check when start command is provided but ready command is not.
 /// Use the same default ready command as E2B
-const DEFAULT_READY_WITH_START_CMD: &str = "sleep 20";
+const DEFAULT_READY_WITH_START_CMD: &str = "/agentenv/bin/busybox sleep 20";
 const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -57,6 +58,7 @@ pub(crate) enum TemplateBuildBase {
 
 #[derive(Debug)]
 pub(crate) struct TemplateBuildContext {
+    pub logger: super::logs::BuildLogger,
     pub build_snapshot_id: SnapshotId,
     pub alias: Option<SnapshotAlias>,
     pub initial_context: CommandContext,
@@ -83,13 +85,42 @@ pub(crate) struct TemplateBuildRunner {
     step_executor: TemplateStepExecutor,
 }
 
-#[derive(Clone, Debug)]
+/// What a template build needs beyond its context and the sandbox itself.
+///
+/// `vmm_binary` is the VMM the build runs on, asked for its version, and
+/// `tools_drive_version` is the one the sandbox was given. Both are recorded
+/// against the snapshot the build produces.
+struct TemplateBuildInputs {
+    sandbox_id: SandboxId,
+    resources: SandboxResources,
+    image_configs: ImageConfigs,
+    vmm_binary: PathBuf,
+    tools_drive_version: String,
+}
+
 pub(crate) struct TemplateBuildExecution {
     pub runtime_versions: SnapshotRuntimeVersions,
-    pub manifest: FirecrackerSnapshotManifest,
+    pub manifest: SandboxSnapshotManifest,
     pub build_context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub image_configs: ImageConfigs,
+    /// Backend capture payload from `capture_to_dir` (the build VM is already
+    /// stopped when this returns; startup-pack recording downcasts it to the
+    /// backend's snapshot config to re-boot from the capture).
+    pub capture_artifacts: Option<Box<dyn std::any::Any + Send>>,
+    /// Local capture output directory (holds vm_state.bin and the pack).
+    pub output_dir: PathBuf,
+}
+
+impl std::fmt::Debug for TemplateBuildExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TemplateBuildExecution")
+            .field("runtime_versions", &self.runtime_versions)
+            .field("manifest", &self.manifest)
+            .field("startup", &self.startup)
+            .field("output_dir", &self.output_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TemplateBuildRunner {
@@ -132,6 +163,8 @@ impl TemplateBuildRunner {
             );
         }
 
+        let sandbox_id = SandboxId::new();
+        let global = ConfigManager::global_config();
         let user_image_config = crate::sandbox::OverlaybdConfig {
             image_config_path: launch_rootfs_path.to_path_buf(),
             read_only: false,
@@ -148,18 +181,22 @@ impl TemplateBuildRunner {
             .then_some(context.initial_context.env_vars.clone());
         config.common.default_user = context.initial_context.user.clone();
         config.common.default_workdir = Some(context.initial_context.workdir.clone());
-        let sandbox_id = SandboxId::new();
         let image_configs = image_configs.clone();
         let launch_config =
             SandboxLaunchConfig::new(sandbox_id, context.build_snapshot_id.to_string())
                 .with_image_configs(&image_configs);
         config = config.apply_launch_config(&launch_config);
 
+        let tools_drive_version = global.resolved_tools_version().to_string();
         self.run_template_build(
             context,
-            sandbox_id,
-            context.resources,
-            image_configs,
+            TemplateBuildInputs {
+                sandbox_id,
+                resources: context.resources,
+                image_configs,
+                vmm_binary: global.resolved_firecracker_binary_path(),
+                tools_drive_version,
+            },
             move || FirecrackerSandbox::new_with_id(config, sandbox_id),
         )
     }
@@ -181,23 +218,44 @@ impl TemplateBuildRunner {
                 .with_image_configs(&image_configs);
         let resources = *base_snapshot.resources();
 
-        self.run_template_build(context, sandbox_id, resources, image_configs, move || {
-            FirecrackerSandbox::from_snapshot(&base_snapshot, &launch_config)
-        })
+        let global = ConfigManager::global_config();
+        let tools_drive_version = base_snapshot
+            .committed()
+            .runtime_versions
+            .tools_drive_version
+            .clone();
+        self.run_template_build(
+            context,
+            TemplateBuildInputs {
+                sandbox_id,
+                resources,
+                image_configs,
+                vmm_binary: global.resolved_firecracker_binary_path(),
+                tools_drive_version,
+            },
+            move || FirecrackerSandbox::from_snapshot(&base_snapshot, &launch_config),
+        )
     }
 
-    fn run_template_build<F>(
+    fn run_template_build<F, S>(
         &self,
         context: &TemplateBuildContext,
-        sandbox_id: SandboxId,
-        resources: SandboxResources,
-        image_configs: ImageConfigs,
+        inputs: TemplateBuildInputs,
         create_sandbox: F,
     ) -> Result<TemplateBuildExecution>
     where
-        F: FnOnce() -> Result<FirecrackerSandbox> + Send + 'static,
+        F: FnOnce() -> Result<S> + Send + 'static,
+        S: SandboxBackend + SandboxExecutor + 'static,
     {
+        let TemplateBuildInputs {
+            sandbox_id,
+            resources,
+            image_configs,
+            vmm_binary,
+            tools_drive_version,
+        } = inputs;
         let worker_span = tracing::debug_span!("template_build_sandbox", sandbox_id = %sandbox_id);
+        let logger = context.logger.clone();
         let step_executor = self.step_executor.clone();
         let steps = context.steps.clone();
         let output_dir = context.local_dir().to_path_buf();
@@ -220,18 +278,24 @@ impl TemplateBuildRunner {
                             "starting template build sandbox"
                         );
                         sandbox.start().await?;
-                        debug!("template build sandbox started");
+                        info!("template build sandbox started");
 
                         let build_context = step_executor
-                            .execute(&sandbox, &steps, initial_context)
+                            .execute(&sandbox, &steps, initial_context, &logger)
                             .await?;
                         ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);
-                        run_startup_commands(&sandbox, startup.as_ref()).await?;
-                        let runtime_versions = SnapshotRuntimeVersions::probe(&sandbox).await?;
+                        run_startup_commands(&sandbox, startup.as_ref(), &logger).await?;
+                        let runtime_versions = crate::sandbox::probe_runtime_versions(
+                            &sandbox,
+                            vmm_binary,
+                            tools_drive_version,
+                        )
+                        .await?;
 
-                        debug!("capturing template snapshot");
-                        let (_, manifest) = sandbox.pause_to_dir(&output_dir).await?;
+                        info!("capturing template snapshot");
+                        let (manifest, capture_artifacts) =
+                            sandbox.capture_to_dir(&output_dir).await?;
                         debug!("template snapshot captured");
 
                         Ok(TemplateBuildExecution {
@@ -240,6 +304,8 @@ impl TemplateBuildRunner {
                             build_context,
                             startup,
                             image_configs,
+                            capture_artifacts,
+                            output_dir: output_dir.clone(),
                         })
                     }
                     .await;
@@ -275,8 +341,8 @@ impl TemplateBuildRunner {
 /// account at build time aligns template builds with what E2B-compatible
 /// clients assume.
 ///
-/// Numeric USER values are left alone (Docker allows a UID with no passwd
-/// entry). An image with no account-management tooling at all (neither
+/// Numeric USER values are resolved during envd initialization (Docker allows
+/// a UID with no passwd entry). An image without account-management tooling (neither
 /// useradd/groupadd nor adduser/addgroup) keeps building with a warning
 /// rather than failing: such an image worked before this provisioning
 /// existed, and only envd calls that resolve the default user will fail.
@@ -467,6 +533,7 @@ fn prepare_startup(
 async fn run_startup_commands(
     sandbox: &impl SandboxExecutor,
     startup: Option<&StartupCommand>,
+    logger: &super::logs::BuildLogger,
 ) -> Result<()> {
     let Some(startup) = startup else {
         return Ok(());
@@ -476,15 +543,20 @@ async fn run_startup_commands(
         None
     } else {
         debug!(command = %startup.start_cmd, "starting startup command");
+        let (shell, flag) = startup.shell_command();
+        let output_logger = logger.clone();
         let handle = sandbox
             .start_process(
-                "/bin/bash",
-                &["-lc", startup.start_cmd.as_str()],
+                shell,
+                &[flag, startup.start_cmd.as_str()],
                 &ProcessOpts {
                     envs: startup.context.env_vars.clone(),
                     cwd: Some(startup.context.workdir.clone()),
                     ..ProcessOpts::default()
-                },
+                }
+                .with_output_callback(move |stderr, bytes| {
+                    output_logger.output(Some("finalize"), stderr, bytes)
+                }),
             )
             .await
             .with_context(|| {
@@ -498,7 +570,7 @@ async fn run_startup_commands(
     };
 
     if !startup.ready_cmd.trim().is_empty() {
-        run_ready_command(sandbox, startup, &mut start_handle).await?;
+        run_ready_command_with_logs(sandbox, startup, &mut start_handle, logger).await?;
     }
 
     if let Some(handle) = start_handle.as_mut() {
@@ -508,20 +580,36 @@ async fn run_startup_commands(
     Ok(())
 }
 
+#[cfg(test)]
 #[tracing::instrument(skip(sandbox, startup, start_cmd_handle))]
 async fn run_ready_command(
     sandbox: &impl SandboxExecutor,
     startup: &StartupCommand,
     start_cmd_handle: &mut Option<ProcessHandle>,
 ) -> Result<()> {
+    run_ready_command_with_logs(sandbox, startup, start_cmd_handle, &Default::default()).await
+}
+
+async fn run_ready_command_with_logs(
+    sandbox: &impl SandboxExecutor,
+    startup: &StartupCommand,
+    start_cmd_handle: &mut Option<ProcessHandle>,
+    logger: &super::logs::BuildLogger,
+) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut attempt = 0_u64;
+    let (shell, flag) = startup.shell_command();
 
+    let output_logger = logger.clone();
     let mut opts = ProcessOpts {
         envs: startup.context.env_vars.clone(),
         cwd: Some(startup.context.workdir.clone()),
         timeout: Some(READY_TIMEOUT),
-    };
+        ..ProcessOpts::default()
+    }
+    .with_output_callback(move |stderr, bytes| {
+        output_logger.output(Some("finalize"), stderr, bytes)
+    });
 
     loop {
         let now = Instant::now();
@@ -547,7 +635,7 @@ async fn run_ready_command(
         }
 
         let output = sandbox
-            .run_command_with_opts("/bin/bash", &["-lc", startup.ready_cmd.as_str()], &opts)
+            .run_command_with_opts(shell, &[flag, startup.ready_cmd.as_str()], &opts)
             .await;
 
         match output {
@@ -671,6 +759,7 @@ mod tests {
         let build_context = CommandContext::new(HashMap::new(), "/work");
         let startup = StartupCommand {
             start_cmd: "python -m http.server".to_string(),
+            shell: None,
             ready_cmd: String::new(),
             context: CommandContext::default(),
         };
@@ -678,7 +767,7 @@ mod tests {
         let startup = prepare_startup(Some(startup), true, &build_context)
             .expect("startup should remain enabled");
 
-        assert_eq!(startup.ready_cmd, "sleep 20");
+        assert_eq!(startup.ready_cmd, "/agentenv/bin/busybox sleep 20");
         assert_eq!(startup.context.workdir, "/work");
     }
 
@@ -687,6 +776,7 @@ mod tests {
         let startup = StartupCommand {
             start_cmd: String::new(),
             ready_cmd: String::new(),
+            shell: None,
             context: CommandContext::default(),
         };
 
@@ -701,6 +791,7 @@ mod tests {
             CommandContext::new(HashMap::from([("BASE".into(), "2".into())]), "/derived");
         let startup = StartupCommand {
             start_cmd: "echo start".to_string(),
+            shell: None,
             ready_cmd: "echo ready".to_string(),
             context: inherited_context,
         };
@@ -926,6 +1017,7 @@ mod tests {
         let startup = StartupCommand {
             start_cmd: String::new(),
             ready_cmd: "echo ready".to_string(),
+            shell: None,
             context: CommandContext::default(),
         };
         let mut start_handle = None;

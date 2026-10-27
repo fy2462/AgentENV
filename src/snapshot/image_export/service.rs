@@ -14,13 +14,15 @@ use super::target::{
 };
 use crate::cfg::{ConfigManager, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind};
 use crate::digest;
-use crate::snapshot::repository::backends::common::acr::{
+use crate::repository::backends::{oss, posixfs};
+use crate::repository::{BlobKey, LayerRole, Repository, RepositoryError, RepositoryResult};
+use crate::snapshot::image_export::acr::{
     build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
     SnapshotOciConfigInput, SourceRegistryRepository,
 };
-use crate::snapshot::repository::backends::{oss, posixfs};
-use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotRepository};
-use crate::snapshot::{CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotId};
+use crate::snapshot::{
+    CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotCatalog, SnapshotId,
+};
 
 /// Outcome of one snapshot image export.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +49,7 @@ fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
 
 /// Orchestrates committed-snapshot rootfs image export.
 pub struct SnapshotImageService {
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<dyn Repository>,
     layers: ManagedLayerLocator,
     regctl: Regctl,
 }
@@ -57,17 +59,14 @@ impl SnapshotImageService {
     /// node-runtime resolver, artifact cache, layer store, and P2P machinery.
     pub fn from_global_config(regctl_binary: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let config = ConfigManager::global_config();
-        let (repository, layers): (Arc<dyn SnapshotRepository>, ManagedLayerLocator) =
+        let (repository, layers): (Arc<dyn Repository>, ManagedLayerLocator) =
             match config.snapshot.repository_backend {
                 SnapshotRepositoryBackendKind::PosixFs => {
                     let posix = config.backend.posix_fs.as_ref().context(
                         "backend.posix_fs config is required when repository_backend = posix_fs",
                     )?;
                     let root = posix.snapshot_store.join("repository");
-                    let repository = Arc::new(posixfs::PosixFsSnapshotRepository::new(
-                        Arc::new(posixfs::PosixFsCatalogStore::new(root.clone())),
-                        Arc::new(posixfs::PosixFsArtifactStore::new(root.clone())),
-                    ));
+                    let repository = Arc::new(posixfs::PosixFsRepository::new(root.clone()));
                     (repository, ManagedLayerLocator::PosixFs { root })
                 }
                 SnapshotRepositoryBackendKind::Oss => {
@@ -90,7 +89,7 @@ impl SnapshotImageService {
                         config.credential_source(),
                         config.addressing_style(),
                     )?);
-                    let repository = Arc::new(oss::OssSnapshotRepository::new(
+                    let repository = Arc::new(oss::OssRepository::new(
                         Arc::clone(&client),
                         config.snapshot_image_storage(),
                         publish_compression,
@@ -306,8 +305,7 @@ impl SnapshotImageService {
     ) -> RepositoryResult<PathBuf> {
         match &self.layers {
             ManagedLayerLocator::PosixFs { root } => {
-                let path =
-                    posixfs::PosixFsSnapshotArtifactLayout::managed_layer_path(root, &layer.digest);
+                let path = root.join(rootfs_layer_key(&layer.digest).posix_path());
                 let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
                     if error.kind() == std::io::ErrorKind::NotFound {
                         RepositoryError::ManagedLayerNotFound {
@@ -334,13 +332,20 @@ impl SnapshotImageService {
                 Ok(path)
             }
             ManagedLayerLocator::Oss { client } => {
-                let key = oss::OssSnapshotArtifactLayout::managed_layer_key(&layer.digest);
+                let key = rootfs_layer_key(&layer.digest).path();
                 let name = layer.digest.replace([':', '/'], "_");
                 let destination = tempdir.join(format!("{name}.overlaybd.commit"));
                 let download = client.get_to_file(&key, &destination);
                 materialize_downloaded_layer(layer, &destination, download).await
             }
         }
+    }
+}
+
+fn rootfs_layer_key(digest: &str) -> BlobKey {
+    BlobKey::Layer {
+        digest: digest.to_owned(),
+        role: LayerRole::Rootfs,
     }
 }
 
@@ -393,8 +398,7 @@ mod tests {
     };
     use super::super::target::SnapshotImageTargetError;
     use super::*;
-    use crate::snapshot::mock::MockSnapshotRepository;
-    use crate::snapshot::repository::backends::posixfs::PosixFsSnapshotArtifactLayout;
+    use crate::snapshot::mock::MockRepository;
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication, SnapshotRecord,
     };
@@ -407,14 +411,14 @@ mod tests {
 
     fn posix_service(root: PathBuf, regctl: impl Into<PathBuf>) -> SnapshotImageService {
         SnapshotImageService {
-            repository: Arc::new(MockSnapshotRepository),
+            repository: Arc::new(MockRepository),
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new(regctl),
         }
     }
 
     fn seed_posix_layer(root: &Path, digest: &str, bytes: &[u8]) -> PathBuf {
-        let path = PosixFsSnapshotArtifactLayout::managed_layer_path(root, digest);
+        let path = root.join(rootfs_layer_key(digest).posix_path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, bytes).unwrap();
         path
@@ -453,10 +457,7 @@ mod tests {
     async fn unknown_or_uncommitted_snapshot_is_rejected() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repository");
-        let repository = posixfs::PosixFsSnapshotRepository::new(
-            Arc::new(posixfs::PosixFsCatalogStore::new(root.clone())),
-            Arc::new(posixfs::PosixFsArtifactStore::new(root.clone())),
-        );
+        let repository = posixfs::PosixFsRepository::new(root.clone());
         let uncommitted =
             SnapshotRecord::template_waiting(SnapshotId::generate(), None, Default::default());
         let lookup = uncommitted.id.to_string();

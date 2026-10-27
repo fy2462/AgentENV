@@ -1,18 +1,23 @@
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::cache::{local_image_services_from_app_config, CachedImageConfig, SourceImageStore};
-use super::oci_image::{self, ResolvedImage};
+use super::oci_image::{self, RegistryAuth, ResolvedImage};
 use super::reference::{image_ref_candidates, registry_host_of};
-use super::{ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult};
+use super::{
+    ImageBaseContext, ImageCatalog, ImageError, ImageResolutionMetadata, ImageResult,
+    IMAGE_TAG_PREFIX,
+};
 use crate::cfg::AppConfig;
 use crate::image::oci_image::ImageFormat;
-use crate::observability::prometheus::MetricGuard;
+use crate::prometheus::MetricGuard;
+use crate::types::{ImageTag, OverlaybdLayerRef};
 
 const IMAGE_RESOLVE_STAGE_DURATION: &str = "agentenv_image_resolve_stage_duration_seconds";
 
@@ -51,8 +56,8 @@ pub struct ResolvedBlockImage {
     pub raw_config: Option<serde_json::Value>,
 }
 
-#[derive(Debug)]
 pub struct ImageResolver {
+    repository: Option<Arc<dyn crate::repository::Repository>>,
     store: Arc<dyn SourceImageStore>,
     overlaybd_install_root: PathBuf,
     overlaybd_convert_global_config: PathBuf,
@@ -65,10 +70,17 @@ pub struct ImageResolver {
     convert_standard_oci: bool,
 }
 
+impl std::fmt::Debug for ImageResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageResolver").finish_non_exhaustive()
+    }
+}
+
 impl ImageResolver {
     pub fn new(config: &AppConfig) -> Self {
         let store = local_image_services_from_app_config(config).source_images;
         Self {
+            repository: None,
             store,
             overlaybd_install_root: config.deps_path.join("overlaybd"),
             overlaybd_convert_global_config: config.resolved_overlaybd_convert_global_config_path(),
@@ -90,12 +102,269 @@ impl ImageResolver {
         &self.default_image
     }
 
+    pub(crate) async fn resolve_buildkit(
+        &self,
+        content: &super::buildkit::BuildkitContent,
+        digest: &str,
+    ) -> Result<ResolvedBlockImage> {
+        anyhow::ensure!(
+            self.convert_standard_oci,
+            "standard OCI conversion is disabled"
+        );
+        let (fetched, metadata) =
+            oci_image::fetch_content_manifest(content, digest, &detect_arch()?).await?;
+        let source = self.store.open(&fetched.manifest_digest, None).await?;
+        if let CachedImageConfig::Found {
+            image_config_path, ..
+        } = source.cached_config().await?
+        {
+            return Ok(resolved_from_cached_config(
+                &fetched.manifest_digest,
+                image_config_path,
+                metadata,
+            ));
+        }
+        let mut conversion = source.begin_conversion().await?;
+        let image = oci_image::convert_content_image(
+            content,
+            &fetched,
+            oci_image::OverlaybdConversionEnv {
+                install_root: &self.overlaybd_install_root,
+                global_config: &self.overlaybd_convert_global_config,
+                converter_id: &self.overlaybd_oci_converter_id,
+                regctl_binary: &self.regctl_binary,
+                registry_config: None,
+            },
+            &mut *conversion,
+        )
+        .await?;
+        let path = source
+            .publish_config(
+                &overlaybd_image_config_json(&image),
+                metadata.clone(),
+                conversion,
+            )
+            .await?;
+        Ok(resolved_from_cached_config(
+            &fetched.manifest_digest,
+            path,
+            metadata,
+        ))
+    }
+
+    pub(crate) async fn resolve_tools(
+        mut self,
+        image_ref: &str,
+    ) -> ImageResult<Option<ResolvedBlockImage>> {
+        // System dependencies use their configured release source, independently
+        // of the admission policy and conversion settings for user images.
+        let arch = detect_arch()?;
+        let mut fetched =
+            oci_image::fetch_oci_manifest(&self.regctl_binary, image_ref, &arch, None).await?;
+        if fetched.format() != ImageFormat::OverlaybdNative {
+            let metadata = oci_image::fetch_oci_image_config_metadata(
+                &self.regctl_binary,
+                &fetched.selected_image_ref,
+                fetched.config_digest(),
+                None,
+            )
+            .await?;
+            match metadata
+                .base_context
+                .labels
+                .get("io.agentenv.tools-drive.format")
+                .map(String::as_str)
+            {
+                None => return Ok(None),
+                Some("oci-rootfs-v1") => {}
+                Some(format) => {
+                    return Err(ImageError::UnsupportedImage {
+                        reason: format!("unsupported tools image format '{format}'"),
+                    })
+                }
+            }
+            // v1 is part of the immutable tools release contract, independently
+            // of runtime upgrades and the conversion policy for user images.
+            const _: () = assert!(oci_image::LAYER_VIRTUAL_SIZE_GIB == 64);
+            let deps = self
+                .overlaybd_install_root
+                .parent()
+                .context("overlaybd dependency root")?;
+            self.overlaybd_install_root =
+                crate::deps::overlaybd_tools::ensure_tools_converter_v1(deps).await?;
+            self.overlaybd_oci_converter_id = "tools-oci-rootfs-v1:overlaybd-v1.0.18-aenv.1".into();
+            self.convert_standard_oci = true;
+            self.try_referrers_overlaybd_prefixes.clear();
+            fetched.repository_scope = Some("tools-oci-rootfs-v1".into());
+        }
+        self.resolve_fetched_manifest(image_ref, &arch, fetched, None)
+            .await
+            .map(Some)
+    }
+
+    pub fn with_repository(mut self, repository: Arc<dyn crate::repository::Repository>) -> Self {
+        self.repository = Some(repository);
+        self
+    }
+
+    pub(crate) async fn publish_image<'a, F, Fut>(
+        &'a self,
+        image: &'a ResolvedBlockImage,
+        store_layers: F,
+    ) -> Result<String>
+    where
+        F: FnOnce(&'a dyn crate::repository::Repository, &'a Path) -> Fut,
+        Fut: Future<Output = crate::repository::RepositoryResult<Vec<OverlaybdLayerRef>>>,
+    {
+        let repository = self
+            .repository
+            .as_ref()
+            .context("image repository is not configured")?;
+        // Capacity eviction takes this same source-image lock. Keep the local
+        // converted layers rooted until the repository has committed them.
+        let source = self.store.open(&image.image_ref, None).await?;
+        let _source_lock = source.begin_conversion().await?;
+        let config = image
+            .raw_config
+            .clone()
+            .context("built image configuration is missing")?;
+        let layers =
+            store_layers(repository.as_ref(), image.overlaybd_config_path.as_path()).await?;
+        let description = super::PublishedImage::new(
+            oci_image::host_arch_to_oci(&detect_arch()?)?.into(),
+            layers,
+            config,
+        );
+        Ok(repository.put_image(&description).await?)
+    }
+
+    async fn resolve_published(&self, digest: &str) -> ImageResult<ResolvedBlockImage> {
+        super::buildkit::validate_digest(digest).map_err(|error| ImageError::InvalidReference {
+            reason: error.to_string(),
+        })?;
+        let repository = self
+            .repository
+            .as_ref()
+            .context("image repository is not configured")?;
+        let image = repository
+            .get_image(digest)
+            .await
+            .map_err(anyhow::Error::from)?
+            .ok_or_else(|| ImageError::NotFound {
+                reason: format!("published OverlayBD image '{digest}' was not found"),
+            })?;
+        if image.architecture != oci_image::host_arch_to_oci(&detect_arch()?)? {
+            return Err(ImageError::UnsupportedImage {
+                reason: format!("image requires {}", image.architecture),
+            });
+        }
+        let metadata = oci_image::parse_oci_image_config(
+            &serde_json::to_string(&json!({"config": image.config}))
+                .map_err(anyhow::Error::from)?,
+        )?;
+        let source = self
+            .store
+            .open(digest, Some("published-overlaybd-v1"))
+            .await?;
+        if let CachedImageConfig::Found {
+            image_config_path, ..
+        } = source.cached_config().await?
+        {
+            return Ok(resolved_from_cached_config(
+                digest,
+                image_config_path,
+                metadata,
+            ));
+        }
+        let conversion = source.begin_conversion().await?;
+        let work = tempfile::tempdir().context("materialize published image")?;
+        let path = crate::repository::materialize_volume_backing(
+            repository.as_ref(),
+            &image.layers,
+            &work.path().join("image.json"),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+        let config: Value =
+            serde_json::from_slice(&tokio::fs::read(path).await.map_err(anyhow::Error::from)?)
+                .map_err(anyhow::Error::from)?;
+        let path = source
+            .publish_config(&config, metadata.clone(), conversion)
+            .await?;
+        Ok(resolved_from_cached_config(digest, path, metadata))
+    }
+
+    /// Resolves a tag to the digest it points to now. The result carries only
+    /// the digest, so moving the tag later never changes this resolution.
+    async fn resolve_tag(&self, reference: &str) -> ImageResult<ResolvedBlockImage> {
+        let tag = ImageTag::parse(reference).map_err(|error| ImageError::InvalidReference {
+            reason: error.to_string(),
+        })?;
+        let repository = self
+            .repository
+            .as_ref()
+            .context("image repository is not configured")?;
+        let digest = repository
+            .get_image_tag(&tag)
+            .await
+            .map_err(anyhow::Error::from)?
+            .ok_or_else(|| ImageError::NotFound {
+                reason: format!("image tag '{tag}' was not found"),
+            })?;
+        debug!(%tag, %digest, "resolved image tag");
+        self.resolve_published(&digest)
+            .await
+            .map_err(|error| error.context(format_args!("image tag '{tag}'")))
+    }
+
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
+        self.resolve_with_registry_auth(image_ref, None).await
+    }
+
+    pub(crate) async fn resolve_with_registry_auth(
+        &self,
+        image_ref: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> ImageResult<ResolvedBlockImage> {
+        // Bare digests identify repository-owned OverlayBD descriptions, not
+        // OCI manifests or node-local conversion cache entries.
+        let trimmed = image_ref.trim();
+        if let Some(reference) = trimmed.strip_prefix(IMAGE_TAG_PREFIX) {
+            if auth.is_some() {
+                return Err(ImageError::InvalidReference {
+                    reason: "fromImageRegistry cannot be used with AgentENV published images"
+                        .into(),
+                });
+            }
+            return self.resolve_tag(reference).await;
+        }
+        if trimmed.starts_with("sha256:") {
+            if auth.is_some() {
+                return Err(ImageError::InvalidReference {
+                    reason: "fromImageRegistry cannot be used with AgentENV published images"
+                        .into(),
+                });
+            }
+            return self.resolve_published(trimmed).await;
+        }
         let candidates = image_ref_candidates(
             image_ref,
             &self.search_registries,
             self.allowed_registries.as_deref(),
         )?;
+        if auth.is_some() && candidates.len() != 1 {
+            return Err(ImageError::InvalidReference {
+                reason: "fromImageRegistry requires an unambiguous image registry; use a fully-qualified fromImage".into(),
+            });
+        }
+        let registry_config = match auth {
+            Some(auth) => Some(
+                auth.config(registry_host_of(&candidates[0]).context("image registry host")?)
+                    .await?,
+            ),
+            None => None,
+        };
+        let config_path = registry_config.as_ref().map(|config| config.path());
         let arch = detect_arch()?;
         let mut manifest_failures = Vec::new();
         // Track whether every candidate failed specifically because the
@@ -110,7 +379,8 @@ impl ImageResolver {
             // aborts the whole resolve.
             let mut metric = MetricGuard::stage(IMAGE_RESOLVE_STAGE_DURATION, "manifest_fetch");
             let fetched =
-                oci_image::fetch_oci_manifest(&self.regctl_binary, &candidate, &arch).await;
+                oci_image::fetch_oci_manifest(&self.regctl_binary, &candidate, &arch, config_path)
+                    .await;
             metric.finish(&fetched);
             let fetched = match fetched {
                 Ok(fetched) => fetched,
@@ -142,7 +412,7 @@ impl ImageResolver {
                 }
             };
             return self
-                .resolve_fetched_manifest(&candidate, &arch, fetched)
+                .resolve_fetched_manifest(&candidate, &arch, fetched, config_path)
                 .await;
         }
 
@@ -158,14 +428,14 @@ impl ImageResolver {
         }
     }
 
-    /// Resolve a successfully-fetched manifest into a block image. Every failure
-    /// here is fatal (the manifest already proved the candidate registry has
-    /// the image), so all errors collapse into [`ImageError::Other`].
+    /// Resolve a successfully-fetched manifest into a block image. Failures
+    /// here are fatal: the manifest already proved the registry has the image.
     async fn resolve_fetched_manifest(
         &self,
         image_ref: &str,
         arch: &str,
         fetched: oci_image::FetchedManifest,
+        registry_config: Option<&std::path::Path>,
     ) -> ImageResult<ResolvedBlockImage> {
         let source_image_ref = fetched.selected_image_ref.clone();
         // Config metadata comes from the source image even when layer
@@ -177,7 +447,13 @@ impl ImageResolver {
             &self.try_referrers_overlaybd_prefixes,
         ) && fetched.format() != ImageFormat::OverlaybdNative
         {
-            match try_resolve_overlaybd_referrer(&self.regctl_binary, &source_image_ref, arch).await
+            match try_resolve_overlaybd_referrer(
+                &self.regctl_binary,
+                &source_image_ref,
+                arch,
+                registry_config,
+            )
+            .await
             {
                 Ok(Some((referrer, artifact_type))) => {
                     overlaybd_image_ref = referrer.selected_image_ref.clone();
@@ -212,6 +488,7 @@ impl ImageResolver {
         } else {
             fetched
         };
+        validate_registry_auth_for_format(fetched.format(), registry_config.is_some())?;
         if fetched.format() == ImageFormat::StandardOci && !self.convert_standard_oci {
             return Err(ImageError::InvalidReference {
                 reason: format!(
@@ -257,6 +534,7 @@ impl ImageResolver {
                     &self.regctl_binary,
                     &source_image_ref,
                     &source_config_digest,
+                    registry_config,
                 )
                 .await
                 .map_err(|e| e.context(format!("fetch image metadata for '{source_image_ref}'")))?;
@@ -284,6 +562,7 @@ impl ImageResolver {
             &self.regctl_binary,
             &source_image_ref,
             &source_config_digest,
+            registry_config,
         )
         .await
         .map_err(|e| e.context(format!("fetch image metadata for '{source_image_ref}'")));
@@ -299,6 +578,7 @@ impl ImageResolver {
                 global_config: &self.overlaybd_convert_global_config,
                 converter_id: &self.overlaybd_oci_converter_id,
                 regctl_binary: &self.regctl_binary,
+                registry_config,
             },
             &mut *conversion,
             arch,
@@ -330,6 +610,20 @@ impl ImageResolver {
     }
 }
 
+/// Validate the final selected format, including any OverlayBD referrer,
+/// before accessing the image cache or fetching config/layer blobs.
+fn validate_registry_auth_for_format(
+    format: ImageFormat,
+    has_registry_auth: bool,
+) -> ImageResult<()> {
+    if format == ImageFormat::OverlaybdNative && has_registry_auth {
+        return Err(ImageError::UnsupportedImage {
+            reason: "fromImageRegistry is not supported for OverlayBD images (including OverlayBD referrers); use a standard OCI image or omit fromImageRegistry and configure server-side registry credentials".into(),
+        });
+    }
+    Ok(())
+}
+
 fn resolved_from_cached_config(
     source_image_ref: &str,
     image_config_path: PathBuf,
@@ -351,17 +645,19 @@ async fn try_resolve_overlaybd_referrer(
     regctl_binary: &std::path::Path,
     subject_ref: &str,
     arch: &str,
+    registry_config: Option<&std::path::Path>,
 ) -> Result<Option<(oci_image::FetchedManifest, &'static str)>> {
     let Some((referrer_digest, artifact_type)) =
-        discover_overlaybd_referrer(regctl_binary, subject_ref).await?
+        discover_overlaybd_referrer(regctl_binary, subject_ref, registry_config).await?
     else {
         return Ok(None);
     };
     let referrer_ref = oci_image::image_ref_with_digest(subject_ref, &referrer_digest)
         .with_context(|| format!("build overlaybd referrer reference for {subject_ref}"))?;
-    let referrer = oci_image::fetch_oci_manifest(regctl_binary, &referrer_ref, arch)
-        .await
-        .with_context(|| format!("fetch overlaybd referrer manifest for {referrer_ref}"))?;
+    let referrer =
+        oci_image::fetch_oci_manifest(regctl_binary, &referrer_ref, arch, registry_config)
+            .await
+            .with_context(|| format!("fetch overlaybd referrer manifest for {referrer_ref}"))?;
     if referrer.format() != ImageFormat::OverlaybdNative {
         bail!(
             "OCI referrer {referrer_ref} advertised artifactType {artifact_type} but its manifest is not overlaybd-native"
@@ -373,6 +669,7 @@ async fn try_resolve_overlaybd_referrer(
 async fn discover_overlaybd_referrer(
     regctl_binary: &std::path::Path,
     subject_ref: &str,
+    registry_config: Option<&std::path::Path>,
 ) -> Result<Option<(String, &'static str)>> {
     oci_image::ensure_regctl_binary(regctl_binary)
         .context("regctl is required to query OCI referrers")?;
@@ -381,7 +678,7 @@ async fn discover_overlaybd_referrer(
     // OVERLAYBD_REFERRER_ARTIFACT_TYPES: `regctl artifact list` takes a single
     // `--filter-artifact-type`, which cannot express "any of these types" in
     // one call.
-    let output = oci_image::regctl_command(regctl_binary)
+    let output = oci_image::regctl_command(regctl_binary, registry_config)
         .arg("artifact")
         .arg("list")
         .arg("--format")
@@ -498,6 +795,7 @@ fn overlaybd_image_config_json(resolved: &ResolvedImage) -> Value {
 mod tests {
     use super::*;
     use crate::cfg::{ImageConfig, ImageResolverConfig};
+    use crate::image::cache::ImageCacheService;
     use tempfile::TempDir;
 
     fn test_resolver_with_search(temp: &TempDir, search_registries: Vec<&str>) -> ImageResolver {
@@ -516,6 +814,62 @@ mod tests {
         };
         ImageConfig::normalize(&mut config.image, temp.path(), temp.path());
         ImageResolver::new(&config)
+    }
+
+    #[tokio::test]
+    async fn registry_auth_rejects_ambiguous_search_before_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolver = test_resolver_with_search(&temp, vec!["one.example", "two.example"]);
+        let auth = RegistryAuth::General {
+            username: "reader".into(),
+            password: "secret".into(),
+        };
+        let error = resolver
+            .resolve_with_registry_auth("team/base", Some(&auth))
+            .await
+            .unwrap_err();
+        assert!(error.is_user_error());
+        assert!(error.to_string().contains("unambiguous"));
+    }
+
+    #[test]
+    fn registry_auth_validates_selected_image_format() {
+        for (format, has_auth, rejected) in [
+            (ImageFormat::StandardOci, false, false),
+            (ImageFormat::StandardOci, true, false),
+            (ImageFormat::OverlaybdNative, false, false),
+            (ImageFormat::OverlaybdNative, true, true),
+        ] {
+            let result = validate_registry_auth_for_format(format, has_auth);
+            if rejected {
+                assert!(matches!(result, Err(ImageError::UnsupportedImage { .. })));
+                assert!(result.unwrap_err().is_user_error());
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_auth_rejects_published_images_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        // No repository is configured: rejection must precede tag/digest lookup.
+        let resolver = test_resolver_with_search(&temp, vec!["registry.example"]);
+        let auth = RegistryAuth::General {
+            username: "reader".into(),
+            password: "secret".into(),
+        };
+        let digest = crate::digest::sha256_digest(b"published image");
+        for reference in [" aenv/web:v1 ", digest.as_str()] {
+            let error = resolver
+                .resolve_with_registry_auth(reference, Some(&auth))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ImageError::InvalidReference { .. }));
+            assert!(error
+                .to_string()
+                .contains("fromImageRegistry cannot be used with AgentENV published images"));
+        }
     }
 
     #[test]
@@ -919,9 +1273,6 @@ mod tests {
         stderr: &str,
         exit_code: i32,
     ) -> std::path::PathBuf {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         let stdout_path = dir.join("stdout");
         let stderr_path = dir.join("stderr");
         std::fs::write(&stdout_path, stdout).expect("write stdout fixture");
@@ -930,25 +1281,23 @@ mod tests {
         // The script locates its fixtures relative to `$0` rather than
         // embedding absolute paths, so a TMPDIR containing shell
         // metacharacters cannot break or inject into the generated script.
-        //
-        // Staged write + rename so the binary is never observed half-written or
-        // non-executable, matching how the real dependency installer stages
-        // downloads.
+        let script = format!(
+            "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
+        );
+
+        // Write in a child and wait for it to exit. Writing in this test process
+        // lets concurrent forks inherit the writable fd and cause ETXTBSY even
+        // after we close it and rename the file; CLOEXEC only closes it at exec.
         let binary = dir.join("regctl");
-        let staged = dir.join("regctl.staged");
-        {
-            let mut file = std::fs::File::create(&staged).expect("create fake regctl");
-            write!(
-                file,
-                "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
-            )
-            .expect("write fake regctl");
-            file.sync_all().expect("sync fake regctl");
-        }
-        let mut permissions = std::fs::metadata(&staged).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&staged, permissions).expect("chmod fake regctl");
-        std::fs::rename(&staged, &binary).expect("publish fake regctl");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+            .arg("install-fake-regctl")
+            .arg(&binary)
+            .arg(script)
+            .status()
+            .expect("install fake regctl");
+        assert!(status.success(), "install fake regctl: {status}");
         binary
     }
 
@@ -988,7 +1337,7 @@ mod tests {
         });
         let regctl = fake_regctl(temp.path(), &body.to_string(), "", 0);
 
-        let discovered = discover_overlaybd_referrer(&regctl, subject)
+        let discovered = discover_overlaybd_referrer(&regctl, subject, None)
             .await
             .expect("discover referrer");
 
@@ -1028,7 +1377,7 @@ mod tests {
             1,
         );
 
-        let error = discover_overlaybd_referrer(&regctl, "demo.azurecr.io/python:3.11-slim")
+        let error = discover_overlaybd_referrer(&regctl, "demo.azurecr.io/python:3.11-slim", None)
             .await
             .expect_err("regctl failure must not be reported as 'no referrer'");
 
@@ -1117,5 +1466,163 @@ mod tests {
             Some(expected_layer_dir.as_str())
         );
         assert!(config["lowers"][0].get("cacheFile").is_none());
+    }
+
+    fn local_resolver(temp: &TempDir) -> (ImageResolver, Arc<ImageCacheService>) {
+        let mut config = AppConfig::default();
+        ImageConfig::normalize(&mut config.image, temp.path(), temp.path());
+        let cache = ImageCacheService::shared_from_app_config(&config);
+        (ImageResolver::new(&config), cache)
+    }
+
+    #[tokio::test]
+    async fn published_image_survives_source_removal_and_resolves_on_another_node() -> Result<()> {
+        use crate::image::test_support::{store_layers, write_built_image};
+        use crate::repository::backends::PosixFsRepository;
+        let shared = TempDir::new()?;
+        let source = TempDir::new()?;
+        let node_a = TempDir::new()?;
+        let node_b = TempDir::new()?;
+        let repository: Arc<dyn crate::repository::Repository> =
+            Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let (publisher, _) = local_resolver(&node_a);
+        let publisher = publisher.with_repository(repository.clone());
+        let raw = json!({"Env": ["A=B"], "Entrypoint": ["/app"], "Cmd": ["serve"], "Healthcheck": {"Test": ["CMD", "true"]}});
+        let built = ResolvedBlockImage {
+            image_ref: crate::digest::sha256_digest(b"original OCI manifest"),
+            overlaybd_config_path: write_built_image(source.path())?,
+            base_context: ImageBaseContext::default(),
+            raw_config: Some(raw.clone()),
+        };
+        let digest = publisher.publish_image(&built, store_layers).await?;
+        assert_ne!(digest, built.image_ref);
+        assert_eq!(publisher.publish_image(&built, store_layers).await?, digest);
+        let mut changed = built.clone();
+        changed.raw_config = Some(json!({"Cmd": ["different"]}));
+        assert_ne!(
+            publisher.publish_image(&changed, store_layers).await?,
+            digest
+        );
+        drop(source);
+        drop(node_a);
+        let (reader, _) = local_resolver(&node_b);
+        let reader = reader.with_repository(repository);
+        let resolved = reader.resolve(&digest).await?;
+        assert_eq!(resolved.image_ref, digest);
+        assert_eq!(resolved.raw_config, Some(raw));
+        assert_eq!(
+            resolved.base_context.env_vars.get("A").map(String::as_str),
+            Some("B")
+        );
+        let config: Value =
+            serde_json::from_slice(&tokio::fs::read(&resolved.overlaybd_config_path).await?)?;
+        assert!(config["lowers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|layer| { std::path::Path::new(layer["file"].as_str().unwrap()).is_file() }));
+        tokio::fs::remove_file(&resolved.overlaybd_config_path).await?;
+        assert!(reader
+            .resolve(&digest)
+            .await?
+            .overlaybd_config_path
+            .is_file());
+        let unknown = crate::digest::sha256_digest(b"unknown");
+        assert!(matches!(
+            reader.resolve(&unknown).await,
+            Err(ImageError::NotFound { .. })
+        ));
+        assert!(matches!(
+            reader.resolve("sha256:invalid").await,
+            Err(ImageError::InvalidReference { .. })
+        ));
+        let key = crate::repository::DocumentKey::image(&digest)?.path();
+        let path = shared.path().join("repository").join(key);
+        let mut description: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        description["config"]["Cmd"] = json!(["tampered"]);
+        std::fs::write(path, serde_json::to_vec(&description)?)?;
+        assert!(
+            format!("{:#}", reader.resolve(&digest).await.unwrap_err()).contains("digest mismatch")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_tags_resolve_to_the_digest_they_point_to_now() -> Result<()> {
+        use crate::image::test_support::{store_layers, write_built_image};
+        use crate::image::ImageCatalog;
+        use crate::repository::backends::PosixFsRepository;
+        let shared = TempDir::new()?;
+        let node = TempDir::new()?;
+        let repository: Arc<dyn crate::repository::Repository> =
+            Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let (resolver, _) = local_resolver(&node);
+        let mut resolver = resolver.with_repository(repository.clone());
+        let mut built = ResolvedBlockImage {
+            image_ref: crate::digest::sha256_digest(b"source manifest"),
+            overlaybd_config_path: write_built_image(&shared.path().join("build"))?,
+            base_context: ImageBaseContext::default(),
+            raw_config: Some(json!({"Cmd": ["v1"]})),
+        };
+        let first = resolver.publish_image(&built, store_layers).await?;
+        built.raw_config = Some(json!({"Cmd": ["v2"]}));
+        let second = resolver.publish_image(&built, store_layers).await?;
+
+        let tag = ImageTag::parse("web:v1")?;
+        repository.put_image_tag(&tag, &first).await?;
+        let resolved = resolver.resolve(" aenv/web:v1 ").await?;
+        assert_eq!(resolved.image_ref, first);
+        assert_eq!(resolved.raw_config, Some(json!({"Cmd": ["v1"]})));
+
+        // The node cache is keyed by digest, so a moved tag is never served stale.
+        repository.put_image_tag(&tag, &second).await?;
+        let resolved = resolver.resolve("aenv/web:v1").await?;
+        assert_eq!(resolved.image_ref, second);
+        assert_eq!(resolved.raw_config, Some(json!({"Cmd": ["v2"]})));
+
+        assert!(matches!(
+            resolver.resolve("aenv/web").await,
+            Err(ImageError::NotFound { .. })
+        ));
+        let gone = ImageTag::parse("web:gone")?;
+        repository
+            .put_image_tag(&gone, &crate::digest::sha256_digest(b"deleted"))
+            .await?;
+        let error = resolver.resolve("aenv/web:gone").await.unwrap_err();
+        assert!(matches!(error, ImageError::NotFound { .. }));
+        assert!(error.to_string().contains("image tag 'web:gone'"));
+        for invalid in [
+            "aenv/Web:v1",
+            "aenv/",
+            "aenv/web:v1:extra",
+            "aenv/team/web:v1",
+        ] {
+            assert!(matches!(
+                resolver.resolve(invalid).await,
+                Err(ImageError::InvalidReference { .. })
+            ));
+        }
+        // With a registry host, an `aenv` namespace still names an OCI image;
+        // denying every registry proves the reference took the OCI path.
+        resolver.allowed_registries = Some(Vec::new());
+        assert!(matches!(
+            resolver.resolve("docker.io/aenv/web:v1").await,
+            Err(ImageError::InvalidReference { reason }) if reason.contains("allowed registr")
+        ));
+        assert!(repository
+            .put_image_tag(&tag, "sha256:short")
+            .await
+            .is_err());
+
+        let path = shared
+            .path()
+            .join("repository")
+            .join(crate::repository::DocumentKey::ImageTag(tag).path());
+        std::fs::write(path, b"\"not-a-digest\"")?;
+        assert!(matches!(
+            resolver.resolve("aenv/web:v1").await,
+            Err(ImageError::Other(_))
+        ));
+        Ok(())
     }
 }

@@ -8,16 +8,16 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::CustomExtensionParams;
+use crate::types::CustomExtensionParams;
+use crate::types::VolumeMode;
 use crate::virtualization::VirtualizationMode;
-use crate::volume::VolumeMode;
 use shell_util::shell_quote;
 
 use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
-use super::value::{SnapshotAlias, SnapshotId};
 use super::version::SnapshotRuntimeVersions;
-use crate::sandbox::FirecrackerSnapshotManifest;
-use crate::types::{ImageConfigs, SandboxResources};
+use crate::snapshot::SandboxSnapshotManifest;
+use crate::types::{ImageConfigs, ManagedLayer, OverlaybdLayerRef, SandboxResources};
+use crate::types::{SnapshotAlias, SnapshotId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,7 +73,14 @@ impl SnapshotPublishMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SnapshotPublishSource {
     Template,
-    Sandbox { source_sandbox_id: String },
+    Sandbox {
+        source_sandbox_id: String,
+        /// User metadata of the source sandbox at capture time. Informational
+        /// provenance only; it is persisted into the snapshot record but never
+        /// affects launching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_sandbox_metadata: Option<HashMap<String, String>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,8 +169,16 @@ impl TemplateBuildInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SnapshotSource {
-    Template { build: TemplateBuildInfo },
-    Sandbox { source_sandbox_id: String },
+    Template {
+        build: TemplateBuildInfo,
+    },
+    Sandbox {
+        source_sandbox_id: String,
+        /// User metadata of the source sandbox at capture time. Informational
+        /// provenance only; it never affects launching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_sandbox_metadata: Option<HashMap<String, String>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +294,18 @@ impl CommandContext {
     }
 }
 
+impl From<crate::image::ImageBaseContext> for CommandContext {
+    fn from(base: crate::image::ImageBaseContext) -> Self {
+        Self::from_env_and_workdir(base.env_vars, base.workdir)
+            .with_user(base.user)
+            .with_exposed_ports(base.exposed_ports)
+            .with_entrypoint(base.entrypoint)
+            .with_cmd(base.cmd)
+            .with_volumes(base.volumes)
+            .with_labels(base.labels)
+    }
+}
+
 fn normalize_workdir(workdir: String) -> String {
     if workdir.trim().is_empty() {
         "/".to_string()
@@ -292,6 +319,18 @@ pub struct StartupCommand {
     pub start_cmd: String,
     pub ready_cmd: String,
     pub context: CommandContext,
+    /// Absent for legacy templates, which use a Bash login shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+}
+
+impl StartupCommand {
+    pub(crate) fn shell_command(&self) -> (&str, &str) {
+        match self.shell.as_deref() {
+            Some(shell) => (shell, "-c"),
+            None => ("/bin/bash", "-lc"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -317,6 +356,11 @@ pub struct CommittedSnapshot {
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// Optional startup memory pack descriptor. Present only when the recording succeeded and its
+    /// repository backend persisted the manifest; absent on older snapshots and best-effort
+    /// recording failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_startup: Option<crate::snapshot::MemoryStartupPackInfo>,
 }
 
 #[cfg(test)]
@@ -339,6 +383,7 @@ impl CommittedSnapshot {
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
+            memory_startup: None,
         }
     }
 }
@@ -352,6 +397,9 @@ pub struct SnapshotRecord {
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
     pub committed: Option<CommittedSnapshot>,
+    /// Set when a delete starts, so nothing is attached to the snapshot after.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleting: bool,
 }
 
 impl SnapshotRecord {
@@ -371,6 +419,7 @@ impl SnapshotRecord {
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
             committed: None,
+            deleting: false,
         }
     }
 
@@ -382,8 +431,15 @@ impl SnapshotRecord {
         source: SnapshotPublishSource,
         now_unix_ms: i64,
     ) {
-        if let SnapshotPublishSource::Sandbox { source_sandbox_id } = source {
-            self.source = SnapshotSource::Sandbox { source_sandbox_id };
+        if let SnapshotPublishSource::Sandbox {
+            source_sandbox_id,
+            source_sandbox_metadata,
+        } = source
+        {
+            self.source = SnapshotSource::Sandbox {
+                source_sandbox_id,
+                source_sandbox_metadata,
+            };
         }
         if let SnapshotSource::Template { build } = &mut self.source {
             build.status = TemplateBuildStatus::Ready;
@@ -425,6 +481,7 @@ impl SnapshotRecord {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             committed: Some(committed),
+            deleting: false,
         }
     }
 }
@@ -434,27 +491,6 @@ fn now_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OverlaybdLayerRef {
-    Managed(ManagedLayer),
-    External(ExternalLayer),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedLayer {
-    pub digest: String,
-    pub size: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uuid: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalLayer {
-    pub digest: String,
-    pub repo_blob_url: String,
-    pub size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,14 +529,14 @@ fn default_runtime_artifact_lease() -> Arc<dyn RuntimeArtifactLease> {
 /// Runtime-ready snapshot with node-local artifact paths.
 pub struct RunnableSnapshot {
     record: SnapshotRecord,
-    manifest: FirecrackerSnapshotManifest,
+    manifest: SandboxSnapshotManifest,
     _lease: Arc<dyn RuntimeArtifactLease>,
 }
 
 impl RunnableSnapshot {
     pub(crate) fn new(
         record: SnapshotRecord,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
         lease: Arc<dyn RuntimeArtifactLease>,
     ) -> Self {
         Self {
@@ -520,19 +556,17 @@ impl RunnableSnapshot {
                 image_config_path: drive.image_config_path.clone(),
                 read_only: drive.read_only,
                 virtual_size: drive.virtual_size,
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                mount_path: crate::types::normalize_mount_path_for_drive(
                     &drive.drive_id,
                     drive.mount_path.clone(),
                 )
-                .unwrap_or_else(|_| {
-                    crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
-                }),
+                .unwrap_or_else(|_| crate::types::ExtraDrive::default_mount_path(&drive.drive_id)),
                 sub_path: drive.sub_path.clone(),
             })
             .collect()
     }
 
-    pub fn manifest(&self) -> &FirecrackerSnapshotManifest {
+    pub fn manifest(&self) -> &SandboxSnapshotManifest {
         &self.manifest
     }
 
@@ -567,14 +601,14 @@ impl RunnableSnapshot {
         record: SnapshotRecord,
         attached_drives: Vec<ResolvedAttachedDrive>,
     ) -> Self {
-        let extra_drives: Vec<crate::sandbox::ExtraDrive> = attached_drives
+        let extra_drives: Vec<crate::types::ExtraDrive> = attached_drives
             .iter()
             .map(ResolvedAttachedDrive::to_extra_drive)
             .collect();
 
         Self {
             record,
-            manifest: FirecrackerSnapshotManifest::for_test(0, &extra_drives),
+            manifest: SandboxSnapshotManifest::for_test(0, &extra_drives),
             _lease: default_runtime_artifact_lease(),
         }
     }
@@ -586,6 +620,17 @@ impl RunnableSnapshot {
     ) -> Self {
         let mut snapshot = Self::from_test_manifest(record, attached_drives);
         snapshot.manifest.volume_drive_slots = 0;
+        snapshot
+    }
+
+    /// Snapshot whose attached drives all occupy reserved slots.
+    #[cfg(test)]
+    pub(crate) fn from_test_slot_drive_manifest(
+        record: SnapshotRecord,
+        attached_drives: Vec<ResolvedAttachedDrive>,
+    ) -> Self {
+        let mut snapshot = Self::from_test_manifest(record, attached_drives);
+        snapshot.manifest.physical_extra_drive_count = 0;
         snapshot
     }
 }
@@ -601,12 +646,12 @@ impl fmt::Debug for RunnableSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use crate::volume::VolumeMode;
+    use crate::types::VolumeMode;
 
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotRecord, SnapshotVolume,
-        TemplateBuildErrorReason,
+        OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotRecord, SnapshotSource,
+        SnapshotVolume, TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
 
@@ -620,6 +665,38 @@ mod tests {
             manifest_digest: "sha256:manifest".to_string(),
             repo_blob_url: "https://registry.example/v2/ns/app/blobs".to_string(),
         }
+    }
+
+    #[test]
+    fn sandbox_source_metadata_serde_is_backward_compatible() {
+        let legacy = r#"{"Sandbox":{"source_sandbox_id":"sandbox-1"}}"#;
+        let source: SnapshotSource = serde_json::from_str(legacy).expect("parse legacy source");
+        let SnapshotSource::Sandbox {
+            ref source_sandbox_id,
+            ref source_sandbox_metadata,
+        } = source
+        else {
+            panic!("expected sandbox source");
+        };
+        assert_eq!(source_sandbox_id, "sandbox-1");
+        assert_eq!(*source_sandbox_metadata, None);
+        // Serializing a metadata-less source keeps the legacy shape.
+        assert_eq!(serde_json::to_string(&source).unwrap(), legacy);
+
+        let with_metadata = r#"{"Sandbox":{"source_sandbox_id":"sandbox-1","source_sandbox_metadata":{"team":"alpha"}}}"#;
+        let source: SnapshotSource =
+            serde_json::from_str(with_metadata).expect("parse metadata source");
+        let SnapshotSource::Sandbox {
+            source_sandbox_metadata,
+            ..
+        } = source
+        else {
+            panic!("expected sandbox source");
+        };
+        assert_eq!(
+            source_sandbox_metadata.as_ref().and_then(|m| m.get("team")),
+            Some(&"alpha".to_string()),
+        );
     }
 
     #[test]
@@ -795,6 +872,48 @@ mod tests {
     #[test]
     fn effective_start_cmd_absent_returns_none() {
         assert_eq!(CommandContext::default().effective_start_cmd(), None);
+    }
+
+    #[test]
+    fn startup_shell_is_backward_compatible() {
+        let legacy = serde_json::json!({"start_cmd": "true", "ready_cmd": "true", "context": CommandContext::default()});
+        let mut startup: super::StartupCommand = serde_json::from_value(legacy).unwrap();
+        assert_eq!(startup.shell_command(), ("/bin/bash", "-lc"));
+        assert!(serde_json::to_value(&startup)
+            .unwrap()
+            .get("shell")
+            .is_none());
+        startup.shell = Some("/bin/sh".to_owned());
+        let restored: super::StartupCommand =
+            serde_json::from_value(serde_json::to_value(&startup).unwrap()).unwrap();
+        assert_eq!(restored.shell_command(), ("/bin/sh", "-c"));
+    }
+
+    #[test]
+    fn legacy_snapshot_startup_roundtrips_without_format_changes() {
+        let mut legacy =
+            serde_json::to_value(SnapshotRecord::mock_ready(CommittedSnapshot::mock())).unwrap();
+        legacy["committed"]["startup"] = serde_json::json!({
+            "start_cmd": "[[ -n $HOME ]] && exec /app/server",
+            "ready_cmd": "test -f /app/ready",
+            "context": CommandContext::new(
+                HashMap::from([("HOME".into(), "/app".into())]),
+                "/app",
+            ),
+        });
+        let record: SnapshotRecord = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            record
+                .committed
+                .as_ref()
+                .unwrap()
+                .startup
+                .as_ref()
+                .unwrap()
+                .shell_command(),
+            ("/bin/bash", "-lc"),
+        );
+        assert_eq!(serde_json::to_value(record).unwrap(), legacy);
     }
 
     #[test]

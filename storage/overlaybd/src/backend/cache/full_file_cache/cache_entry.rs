@@ -11,16 +11,37 @@ use std::future::Future;
 use std::os::fd::AsFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 use zerocopy::U64;
 
 use super::super::meta::{
     fsync, now_unix_nanos, BlockLoadState, CacheMetaDisk, CacheMetaDiskHeader, EntryPaths,
 };
+use super::super::PAGE_SIZE;
 use super::cache_pool::FileCacheBackendOptions;
 use crate::sys;
-use storage_util::MMapRegion;
+use storage_util::{MMapRegion, MMapRegionSlice};
+
+// Query once for all cache pools. The host page size can differ from the
+// cache's 4 KiB block alignment (e.g. 16 KiB on native Apple Silicon macOS).
+static MMAP_PAGE_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    // SAFETY: sysconf has no pointer arguments or additional preconditions.
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    // sysconf reports failure as -1. Fall back to the cache block alignment
+    // rather than rounding every mapping up to u64::MAX.
+    match u64::try_from(raw) {
+        Ok(page_size) if page_size > 0 => page_size,
+        _ => {
+            tracing::warn!(
+                page_size = raw,
+                fallback = PAGE_SIZE,
+                "invalid host page size; using cache block alignment for mmap accounting"
+            );
+            PAGE_SIZE
+        }
+    }
+});
 
 /// The core per-cache-entry object. One per remote file (keyed by cache_id).
 ///
@@ -39,6 +60,11 @@ pub(crate) struct CacheEntry {
     pub(crate) index: RwLock<RoaringBitmap>,
     // Hot: per-block inflight dedup (only accessed on miss)
     pub(crate) block_states: Mutex<HashMap<u64, BlockLoadState>>,
+    /// Shared in-flight uncached source reads, one per block: the first
+    /// reader publishes a shared future and concurrent readers await a clone
+    /// of it, so the source is read once. Independent of the refill election
+    /// in `block_states`.
+    pub(crate) miss_fanouts: Mutex<HashMap<u64, SharedBlockRead>>,
 
     /// Memory-mapped region over the data file for zero-copy I/O
     pub(crate) mem_region: MMapRegion,
@@ -55,9 +81,18 @@ pub(crate) struct CacheEntry {
     pub(crate) dirty: AtomicBool,
     // Open-file reference count
     pub(crate) open_count: AtomicUsize,
-    /// Coordinates block refills with logical eviction of this entry.
-    pub(crate) refill_eviction_barrier: tokio::sync::RwLock<()>,
+    /// Coordinates block refills and zero-copy reads with logical eviction of
+    /// this entry. Eviction takes the write side; refills and returned read
+    /// slices hold read permits.
+    pub(crate) refill_eviction_barrier: Arc<tokio::sync::RwLock<()>>,
 }
+
+/// Shared in-flight uncached source read of one block: any awaiter's poll
+/// drives the fetch, and every awaiter receives a clone of the output
+/// (errors are Arc-wrapped so the output is `Clone`).
+pub(crate) type SharedBlockRead = futures_util::future::Shared<
+    futures_util::future::BoxFuture<'static, Result<Bytes, Arc<anyhow::Error>>>,
+>;
 
 impl std::fmt::Debug for CacheEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -95,6 +130,21 @@ pub(crate) enum RangeAllocation {
     /// still present. This is the case on **all** of macOS, not just exotic
     /// filesystems; see [`sys::reserve_space`] for why.
     Unsupported,
+}
+
+/// Bytes owner for zero-copy cached reads. Keeps the mmap slice alive and
+/// holds a read permit on the entry's refill/eviction barrier for the
+/// lifetime of the returned `Bytes`, so a hole-punching eviction cannot run
+/// while the data is still being consumed.
+struct CachedBlockBytes {
+    slice: MMapRegionSlice,
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl AsRef<[u8]> for CachedBlockBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.slice.as_ref()
+    }
 }
 
 /// RAII guard for a reserved-but-not-yet-published disk range, returned by
@@ -182,6 +232,23 @@ impl<'a> Future for AcquireRefillFut<'a> {
 }
 
 impl CacheEntry {
+    /// Page-rounded size of this entry's mapping, even if readers also hold it.
+    pub(crate) fn mmap_bytes(&self) -> u64 {
+        (self.mem_region.len() as u64).next_multiple_of(*MMAP_PAGE_SIZE)
+    }
+
+    fn account_mapping(region: &mut MMapRegion, total: Arc<AtomicU64>) -> Result<()> {
+        let bytes = (region.len() as u64).next_multiple_of(*MMAP_PAGE_SIZE);
+        let on_unmap_total = total.clone();
+        region.on_unmap(move || {
+            on_unmap_total.fetch_sub(bytes, Ordering::Relaxed);
+        })?;
+        // The mapping is still exclusively owned here. Count it only after
+        // registering the callback, before sharing it with any readers.
+        total.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------
@@ -197,6 +264,7 @@ impl CacheEntry {
         source_size: u64,
         options: &FileCacheBackendOptions,
         paths: EntryPaths,
+        mmap_bytes: Arc<AtomicU64>,
     ) -> Result<Arc<Self>> {
         if source_size == 0 {
             bail!("cannot create cache entry with source_size == 0");
@@ -214,8 +282,9 @@ impl CacheEntry {
         // Make it a sparse file of the right size.
         data_file.set_len(source_size)?;
 
-        let mem_region = MMapRegion::from_fd(&data_file, 0, source_size as usize)
+        let mut mem_region = MMapRegion::from_fd(&data_file, 0, source_size as usize)
             .map_err(|e| anyhow!("mmap cache data file: {e}"))?;
+        Self::account_mapping(&mut mem_region, mmap_bytes)?;
 
         Ok(Arc::new(Self {
             cache_id,
@@ -233,7 +302,8 @@ impl CacheEntry {
             refills: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             open_count: AtomicUsize::new(0),
-            refill_eviction_barrier: tokio::sync::RwLock::new(()),
+            miss_fanouts: Mutex::new(HashMap::new()),
+            refill_eviction_barrier: Arc::new(tokio::sync::RwLock::new(())),
         }))
     }
 
@@ -246,6 +316,7 @@ impl CacheEntry {
         cache_id: String,
         paths: EntryPaths,
         options: &FileCacheBackendOptions,
+        mmap_bytes: Arc<AtomicU64>,
     ) -> Result<Arc<Self>> {
         // Verify data file exists
         if !paths.meta_path.try_exists()? {
@@ -294,8 +365,9 @@ impl CacheEntry {
             );
         }
 
-        let mem_region = MMapRegion::from_fd(&data_file, 0, source_size as usize)
+        let mut mem_region = MMapRegion::from_fd(&data_file, 0, source_size as usize)
             .map_err(|e| anyhow!("mmap cache data file on load: {e}"))?;
+        Self::account_mapping(&mut mem_region, mmap_bytes)?;
 
         Ok(Arc::new(Self {
             cache_id,
@@ -313,7 +385,8 @@ impl CacheEntry {
             refills: AtomicU64::new(meta.header.refills.get()),
             dirty: AtomicBool::new(false),
             open_count: AtomicUsize::new(0),
-            refill_eviction_barrier: tokio::sync::RwLock::new(()),
+            miss_fanouts: Mutex::new(HashMap::new()),
+            refill_eviction_barrier: Arc::new(tokio::sync::RwLock::new(())),
         }))
     }
 
@@ -321,12 +394,22 @@ impl CacheEntry {
     // Block I/O — zero-copy via mmap
     // -----------------------------------------------------------------------
 
-    /// Read a cached block. Returns `None` if the block is not in the bitmap.
+    /// Read a cached block. Returns `None` if the block is not in the bitmap
+    /// or if an eviction of this entry is pending or running (reported as a
+    /// miss; the caller refills or falls back to the source).
     ///
-    /// The returned `Bytes` is backed by the mmap region (zero-copy). The
-    /// underlying mapping is kept alive by reference counting inside the
-    /// `MMapRegionSlice` owner.
+    /// The returned `Bytes` is backed by the mmap region (zero-copy) and holds
+    /// a read permit on the refill/eviction barrier for its whole lifetime, so
+    /// the data cannot be hole-punched while it is still being consumed.
     pub(crate) fn read_block(&self, block_id: u64) -> Result<Option<Bytes>> {
+        // Take the read permit first: the bitmap check must not race with an
+        // eviction that clears the bitmap and hole-punches the data file. A
+        // failed try-read (an eviction is pending or running) is reported as a
+        // miss; the caller refills or falls back to the source.
+        let Ok(guard) = self.refill_eviction_barrier.clone().try_read_owned() else {
+            return Ok(None);
+        };
+
         if !self.index.read().contains(block_id as u32) {
             return Ok(None);
         }
@@ -347,7 +430,10 @@ impl CacheEntry {
             )
         })?;
 
-        Ok(Some(Bytes::from_owner(slice)))
+        Ok(Some(Bytes::from_owner(CachedBlockBytes {
+            slice,
+            _guard: guard,
+        })))
     }
 
     /// Reserve disk blocks for `[offset, offset + len)` of the sparse data

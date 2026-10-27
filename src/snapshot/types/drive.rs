@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::snapshot::OverlaybdLayerRef;
-use crate::sandbox::ExtraDrive;
+use crate::types::{ExtraDrive, OverlaybdLayerRef};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 /// Attached-drive state resolved into local runtime inputs for the current node.
@@ -57,7 +56,7 @@ impl ResolvedAttachedDrive {
                 virtual_size: Some(*virtual_size),
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: None,
-                volume: false,
+                kind: crate::types::ExtraDriveKind::Physical,
             },
         }
     }
@@ -103,7 +102,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{CommittedAttachedDrive, ResolvedAttachedDrive};
-    use crate::sandbox::ExtraDrive;
+    use crate::types::ExtraDrive;
 
     fn sample_resolved() -> ResolvedAttachedDrive {
         ResolvedAttachedDrive::Overlaybd {

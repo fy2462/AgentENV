@@ -126,6 +126,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub node_identity: NodeIdentityConfig,
     #[config(nested)]
+    pub template_build: TemplateBuildConfig,
+    #[config(nested)]
     pub memory_snapshot: MemorySnapshotConfig,
     #[config(nested)]
     pub pool: PoolTomlConfig,
@@ -174,12 +176,12 @@ pub struct FirecrackerConfig {
     pub work_dir: Option<PathBuf>,
     /// Optional override for the persistent Firecracker serial output directory.
     /// Defaults to `$AENV_HOME/logs/serial` after normalization.
-    /// Files are grouped under `{serial_dir}/{sandbox_id}/`.
+    /// Files are grouped under `{serial_dir}/{sandbox_id}/` when logging is enabled.
     #[config(env = "AENV_FIRECRACKER_SERIAL_DIR", parse_env = parse_required_path)]
     pub serial_dir: Option<PathBuf>,
     /// Optional Firecracker log level (e.g. "Error", "Warning", "Info", "Debug", "Trace").
-    /// When set (non-empty), Firecracker logging is enabled and written to a
-    /// `firecracker.log` file in the same directory as the Firecracker stdout log.
+    /// When set (non-empty), enables stdout/stderr capture and Firecracker logging
+    /// to `firecracker.log` in the same directory. Unset/empty disables all three.
     pub log_level: Option<String>,
 }
 
@@ -292,6 +294,9 @@ impl std::fmt::Debug for SandboxConfig {
     }
 }
 
+/// Firecracker exposes /dev/vdc through /dev/vdz for extra drives.
+pub const MAX_VOLUME_MOUNTS: usize = 24;
+
 #[derive(Debug, Config, Clone)]
 pub struct VolumeConfig {
     /// Operator-configured maximum persistent volume size in MiB.
@@ -354,6 +359,8 @@ pub struct SnapshotConfig {
     pub image_publish: SnapshotImagePublishConfig,
     #[config(nested)]
     pub publish_compression: SnapshotPublishCompressionConfig,
+    #[config(nested)]
+    pub memory_startup_pack: SnapshotStartupPackConfig,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -389,6 +396,44 @@ pub struct SnapshotPublishCompressionConfig {
 pub enum OssAddressingStyle {
     Path,
     Virtual,
+}
+
+/// Publish-time startup memory manifest (OSS backend only). Records the
+/// pages touched during a short local re-resume at capture, uploads a tiny
+/// v3 page manifest in first-touch order, and prefetches the listed
+/// positions concurrently on cold resume. Pages not yet prefetched fall back
+/// to the normal OverlayBD demand path immediately.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotStartupPackConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Minimum observation window after the recording device's first read.
+    #[config(default = 200u64)]
+    pub record_min_window_ms: u64,
+    /// Stop recording when no new page AND no in-flight read persists for
+    /// this long (in-flight reads never count as quiet).
+    #[config(default = 300u64)]
+    pub record_quiet_ms: u64,
+    /// Hard cap of the recording window.
+    #[config(default = 2000u64)]
+    pub record_max_window_ms: u64,
+    /// Best-effort budget for prepare + record + package; aborts the pack
+    /// (not the publish) when exceeded. Cleanup is NOT bounded by this.
+    #[config(default = 10u64)]
+    pub record_budget_secs: u64,
+    /// Per-pack page-data cap (hard truncation in the pack writer).
+    #[config(default = 1073741824u64)]
+    pub max_pack_bytes: u64,
+    /// Consume startup manifests at resume time (A/B switch, independent of
+    /// recording): register the manifest's layers with the shared layer cache
+    /// and prefetch their listed blocks. Legacy v1/v2 records and missing
+    /// descriptors always fall back to plain on-demand resume.
+    #[config(default = false)]
+    pub consume_enabled: bool,
+    /// Hard bound on a manifest's queueing plus download time; an overdue
+    /// manifest fails and resume proceeds on-demand.
+    #[config(default = 30u64)]
+    pub consume_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -456,6 +501,11 @@ pub struct UblkOverlaybdTomlConfig {
     /// Timeout for the OverlayBD resize tool. Default: `120`.
     #[config(default = 120u64)]
     pub resize_timeout_secs: u64,
+    /// Worker threads of the overlaybd runtime's dedicated remote-I/O
+    /// runtime (OSS/registry downloads); written as `remoteIoWorkers` into
+    /// generated overlaybd global configs. Default: `4`.
+    #[config(default = 4u64)]
+    pub remote_io_workers: u64,
     /// Enable overlaybd layer-level background download. Default: `false`.
     #[config(default = false)]
     pub download_enable: bool,
@@ -485,6 +535,23 @@ pub struct MemorySnapshotConfig {
     pub track_dirty_pages: bool,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
+}
+
+/// Resources for managed Dockerfile build workers.
+#[derive(Debug, Config, Clone)]
+pub struct TemplateBuildConfig {
+    /// Maximum managed builds admitted per node, including publication and cleanup.
+    #[config(default = 4usize)]
+    pub max_concurrent_builds: usize,
+    #[config(default = "docker.io/moby/buildkit:v0.33.0")]
+    pub builder_image: String,
+    #[config(default = 16u32)]
+    pub builder_cpu_count: u32,
+    #[config(default = 32768u32)]
+    pub builder_memory_mb: u32,
+    /// Capacity of each build's writable clone of the repository's shared cache seed.
+    #[config(default = 65536u64)]
+    pub cache_size_mb: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -570,6 +637,11 @@ pub struct NodeIdentityConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct OrchestratorConfig {
+    #[config(default = 15u64)]
+    pub metrics_interval_secs: u64,
+    #[config(default = 3600u64)]
+    pub metrics_retention_secs: u64,
+
     #[config(default = 1000u64)]
     pub auto_evict_interval_ms: u64,
     #[config(default = 15u64)]
@@ -600,12 +672,19 @@ pub struct CustomExtensionConfig {
     pub timeout_ms: u64,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum P2pTransportKind {
+    Disabled,
+    Iroh,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct P2pConfig {
     #[config(default = false)]
     pub enabled: bool,
     #[config(default = "iroh")]
-    pub transport: crate::p2p::P2pTransportKind,
+    pub transport: P2pTransportKind,
     #[config(default = "$AENV_HOME/p2p/store")]
     pub store_dir: PathBuf,
     #[config(default = "0.0.0.0:0")]
@@ -654,6 +733,7 @@ impl_config_default!(
     UblkTomlConfig,
     UblkOverlaybdTomlConfig,
     MemorySnapshotConfig,
+    TemplateBuildConfig,
     MemorySnapshotBackgroundDownloadConfig,
     ObservabilityConfig,
     ObservabilitySchedulerReportConfig,
@@ -951,10 +1031,37 @@ impl AppConfig {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
         }
         self.validate_memory_snapshot_options()?;
+        if self.ublk.overlaybd.remote_io_workers == 0 {
+            bail!("invalid ublk.overlaybd config: remote_io_workers must be > 0");
+        }
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
         self.validate_volume_limits()?;
+        self.validate_template_builder()?;
+        Ok(())
+    }
+
+    fn validate_template_builder(&self) -> Result<()> {
+        let builder = &self.template_build;
+        if builder.max_concurrent_builds == 0 {
+            bail!("template_build.max_concurrent_builds must be greater than 0");
+        }
+        if builder.builder_image.trim().is_empty() {
+            bail!("template_build.builder_image must not be empty");
+        }
+        if !(1..=255).contains(&builder.builder_cpu_count) {
+            bail!("template_build.builder_cpu_count must be between 1 and 255");
+        }
+        if !(256..=i32::MAX as u32).contains(&builder.builder_memory_mb) {
+            bail!(
+                "template_build.builder_memory_mb must be between 256 and {} MiB",
+                i32::MAX
+            );
+        }
+        if builder.cache_size_mb < 1024 {
+            bail!("template_build.cache_size_mb must be at least 1024 MiB");
+        }
         Ok(())
     }
 
@@ -968,12 +1075,10 @@ impl AppConfig {
                 u64::MAX / (1024 * 1024)
             );
         }
-        if self.volume.max_volume_count == 0
-            || self.volume.max_volume_count > crate::volume::MAX_VOLUME_MOUNTS
-        {
+        if self.volume.max_volume_count == 0 || self.volume.max_volume_count > MAX_VOLUME_MOUNTS {
             bail!(
                 "volume.max_volume_count must be between 1 and {}",
-                crate::volume::MAX_VOLUME_MOUNTS
+                MAX_VOLUME_MOUNTS
             );
         }
         Ok(())
@@ -1380,6 +1485,7 @@ impl SandboxProxyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use tempfile::tempdir;
 
     #[test]
@@ -1387,6 +1493,135 @@ mod tests {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
         Ok(())
+    }
+
+    /// Dotted paths of every leaf key in the configuration schema.
+    fn config_keys(meta: &confique::meta::Meta, prefix: &str, keys: &mut BTreeSet<String>) {
+        for field in meta.fields {
+            let path = if prefix.is_empty() {
+                field.name.to_string()
+            } else {
+                format!("{prefix}.{}", field.name)
+            };
+            match field.kind {
+                confique::meta::FieldKind::Leaf { .. } => {
+                    keys.insert(path);
+                }
+                confique::meta::FieldKind::Nested { meta } => config_keys(meta, &path, keys),
+            }
+        }
+    }
+
+    /// Keys in the reference's tables. A `` ## `[section]` `` heading sets the
+    /// table prefix, `## Global Settings` selects top-level keys, and any
+    /// other `##` heading ends the current section. A row may name a
+    /// subsection in its first column, as in `` | `[pool.block]` | `enabled` | ``.
+    fn documented_config_keys(reference: &str) -> BTreeSet<String> {
+        // Documents config/deps_manifest.toml, not the runtime configuration.
+        const OTHER_FILE_SECTIONS: &[&str] = &["protoc"];
+
+        let mut keys = BTreeSet::new();
+        let mut section = None;
+        for line in reference.lines() {
+            if let Some(heading) = line.strip_prefix("## ") {
+                section = match heading {
+                    "Global Settings" => Some(String::new()),
+                    _ => heading
+                        .strip_prefix("`[")
+                        .and_then(|rest| rest.strip_suffix("]`"))
+                        .filter(|name| !OTHER_FILE_SECTIONS.contains(name))
+                        .map(|name| format!("{name}.")),
+                };
+                continue;
+            }
+            let (Some(section), Some(row)) = (&section, line.strip_prefix("| `")) else {
+                continue;
+            };
+            let Some((first, rest)) = row.split_once("` |") else {
+                continue;
+            };
+            let key = match first.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                Some(subsection) => match rest.trim_start().strip_prefix('`') {
+                    Some(rest) => match rest.split_once('`') {
+                        Some((key, _)) => format!("{subsection}.{key}"),
+                        None => continue,
+                    },
+                    None => continue,
+                },
+                None => format!("{section}{first}"),
+            };
+            keys.insert(key);
+        }
+        keys
+    }
+
+    #[test]
+    fn configuration_reference_documents_every_key() {
+        let mut keys = BTreeSet::new();
+        config_keys(&AppConfig::META, "", &mut keys);
+        let documented =
+            documented_config_keys(include_str!("../docs/src/configuration/reference.md"));
+
+        // A leaf such as `backend.oss` deserializes a whole table that the
+        // schema cannot list, so its documented subkeys stand for it.
+        let within_leaf = |key: &String| {
+            keys.iter()
+                .any(|leaf| key.starts_with(leaf) && key[leaf.len()..].starts_with('.'))
+        };
+        let undocumented: Vec<_> = keys
+            .iter()
+            .filter(|key| {
+                !documented.contains(*key)
+                    && !documented.iter().any(|doc| {
+                        doc.starts_with(key.as_str()) && doc[key.len()..].starts_with('.')
+                    })
+            })
+            .collect();
+        let unknown: Vec<_> = documented
+            .iter()
+            .filter(|key| !keys.contains(*key) && !within_leaf(key))
+            .collect();
+        assert!(
+            undocumented.is_empty() && unknown.is_empty(),
+            "docs/src/configuration/reference.md is out of date\n\
+             missing keys: {undocumented:?}\n\
+             keys not in src/cfg.rs: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn bundled_default_config_sets_only_known_keys() {
+        fn walk(
+            table: &toml::Table,
+            prefix: &str,
+            keys: &BTreeSet<String>,
+            unknown: &mut Vec<String>,
+        ) {
+            for (name, value) in table {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                if keys.contains(&path) {
+                    continue;
+                }
+                match value {
+                    toml::Value::Table(table) => walk(table, &path, keys, unknown),
+                    _ => unknown.push(path),
+                }
+            }
+        }
+
+        let mut keys = BTreeSet::new();
+        config_keys(&AppConfig::META, "", &mut keys);
+        let bundled: toml::Table = toml::from_str(include_str!("../config/default.toml")).unwrap();
+        let mut unknown = Vec::new();
+        walk(&bundled, "", &keys, &mut unknown);
+        assert!(
+            unknown.is_empty(),
+            "config/default.toml sets keys that src/cfg.rs does not read: {unknown:?}"
+        );
     }
 
     #[test]
@@ -1407,6 +1642,44 @@ mod tests {
             access_token_hash_seed: Some("cluster-secret".to_string()),
         };
         assert!(!format!("{config:?}").contains("cluster-secret"));
+    }
+
+    #[test]
+    fn template_builder_defaults_and_validation() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.template_build.builder_cpu_count, 16);
+        assert_eq!(config.template_build.builder_memory_mb, 32768);
+        assert_eq!(config.template_build.max_concurrent_builds, 4);
+        assert_eq!(config.template_build.cache_size_mb, 65536);
+        assert_eq!(
+            config.template_build.builder_image,
+            format!(
+                "docker.io/moby/buildkit:{}",
+                include_str!("../config/buildkit-version").trim()
+            )
+        );
+        config.validate_template_builder().unwrap();
+        config.template_build.max_concurrent_builds = 0;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.max_concurrent_builds = 1;
+        config.validate_template_builder().unwrap();
+        config.template_build.builder_cpu_count = 0;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_cpu_count = 16;
+        config.template_build.builder_memory_mb = 255;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_memory_mb = i32::MAX as u32;
+        config.validate_template_builder().unwrap();
+        config.template_build.builder_memory_mb += 1;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_memory_mb = 32768;
+        config.volume.max_size_mb = 8192;
+        config.validate().unwrap();
+        config.template_build.cache_size_mb = 1023;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.cache_size_mb = 65536;
+        config.template_build.builder_image = " ".into();
+        assert!(config.validate_template_builder().is_err());
     }
 
     #[test]
@@ -1544,7 +1817,7 @@ mod tests {
         assert!(error.to_string().contains("volume.max_size_mb"));
 
         let mut config = AppConfig::default();
-        config.volume.max_volume_count = crate::volume::MAX_VOLUME_MOUNTS + 1;
+        config.volume.max_volume_count = MAX_VOLUME_MOUNTS + 1;
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("volume.max_volume_count"));
     }

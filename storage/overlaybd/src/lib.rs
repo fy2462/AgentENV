@@ -33,7 +33,10 @@ pub mod helper {
     pub use crate::image::helper::*;
 }
 mod metrics;
+pub mod pack_planner;
 pub mod prefetch;
+pub mod startup_manifest;
+pub mod startup_pack;
 pub mod snapshot {
     #[cfg(feature = "full")]
     pub use crate::image::snapshot::*;

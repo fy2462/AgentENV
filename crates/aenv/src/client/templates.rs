@@ -2,6 +2,23 @@ use super::{handle_status, Client};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Build-status values from the API's `TemplateBuildStatus` contract.
+///
+/// Kept next to the client so the completion providers and the build watcher
+/// agree on the strings. A status outside this list is unknown: the watcher
+/// keeps polling it rather than treating the build as finished, and completion
+/// eligibility follows the same rule.
+pub mod build_status {
+    /// The build succeeded; the template can be started.
+    pub const READY: &str = "ready";
+    /// The build failed; the template cannot be started.
+    pub const ERROR: &str = "error";
+    /// The build is queued but has not started running yet.
+    pub const WAITING: &str = "waiting";
+    /// The build is running.
+    pub const BUILDING: &str = "building";
+}
+
 #[derive(Debug, Serialize)]
 pub struct CreateTemplateV3 {
     pub name: String,
@@ -11,6 +28,9 @@ pub struct CreateTemplateV3 {
     pub cpu_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "memoryMB")]
     pub memory_mb: Option<u32>,
+    /// Build a reusable image named `name` instead of a template.
+    #[serde(skip_serializing_if = "std::ops::Not::not", rename = "imageOnly")]
+    pub image_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +59,10 @@ pub struct TemplateV3Response {
     pub template_id: String,
     #[serde(rename = "buildID")]
     pub build_id: String,
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -82,8 +106,20 @@ pub struct TemplateBuildInfo {
     #[serde(rename = "buildID")]
     pub build_id: String,
     pub status: String,
+    #[serde(default, rename = "logEntries")]
+    pub log_entries: Vec<BuildLogEntry>,
     #[serde(default)]
     pub reason: Option<BuildStatusReason>,
+    /// The published image of a ready imageOnly build.
+    #[serde(default, rename = "imageDigest")]
+    pub image_digest: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BuildLogEntry {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub level: String,
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,10 +168,11 @@ impl Client {
         &self,
         template_id: &str,
         build_id: &str,
+        logs_offset: usize,
     ) -> Result<TemplateBuildInfo> {
         let resp = handle_status(
             self.get(&format!(
-                "/templates/{template_id}/builds/{build_id}/status"
+                "/templates/{template_id}/builds/{build_id}/status?logsOffset={logs_offset}"
             ))
             .call(),
         )?;

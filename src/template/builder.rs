@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Error as AnyhowError;
@@ -9,7 +10,9 @@ use super::build_spec::{TemplateBuildRootfsBase, TemplateBuildSpec};
 use super::errors::{
     TemplateBuildError, TemplateBuildFailure, TemplateBuildResult, TemplatePipelineResult,
 };
-use super::runner::{TemplateBuildBase, TemplateBuildContext, TemplateBuildRunner};
+use super::runner::{
+    TemplateBuildBase, TemplateBuildContext, TemplateBuildExecution, TemplateBuildRunner,
+};
 use crate::cfg::ConfigManager;
 use crate::sandbox::UblkConfig;
 use crate::snapshot::{
@@ -17,6 +20,19 @@ use crate::snapshot::{
     SnapshotPublishSource, SnapshotRecord, StartupCommand, TemplateBuildErrorReason,
 };
 use crate::types::SandboxResources;
+
+/// Tie a template startup recording to its temporary build workspace. Both
+/// the recorder task and the detached repository continuation receive a lease,
+/// so either can safely outlive synchronous publication.
+fn spawn_template_startup_recording<F>(
+    recorder: F,
+    workspace: Arc<TempDir>,
+) -> crate::snapshot::StartupRecording
+where
+    F: Future<Output = Option<PathBuf>> + Send + 'static,
+{
+    crate::snapshot::StartupRecording::spawn_with_capture_lease(recorder, workspace)
+}
 
 #[derive(Clone)]
 /// Coordinates template-builder flows over committed snapshots.
@@ -104,7 +120,11 @@ impl TemplateBuilder {
         operation: &'static str,
     ) -> TemplatePipelineResult<SnapshotRecord> {
         info!("executing template build");
-        let build_execution = match TemplateBuildRunner::new().execute(&context) {
+        let (context, execution) = Self::execute_in_background(context, |context| {
+            TemplateBuildRunner::new().execute(context)
+        })
+        .await?;
+        let build_execution = match execution {
             Ok(execution) => execution,
             Err(error) => {
                 let reason = Self::build_failure_reason(&error);
@@ -115,6 +135,7 @@ impl TemplateBuilder {
                 .into());
             }
         };
+        let workspace_lease = Arc::new(context.workspace);
         let mut resources = context.resources;
         resources.disk_size_mib = build_execution
             .manifest
@@ -125,6 +146,27 @@ impl TemplateBuilder {
             .unwrap_or(u32::MAX);
 
         info!("publishing template snapshot");
+        // Best-effort: spawn the startup-manifest recording now so the
+        // throwaway recording VM overlaps the backend's layer uploads (a
+        // no-op task when the feature is disabled or the backend carries no
+        // capture payload); a detached continuation uploads the manifest once
+        // the trace lands.
+        let recording = build_execution
+            .capture_artifacts
+            .and_then(|artifacts| {
+                artifacts
+                    .downcast::<crate::sandbox::FirecrackerSnapshotConfig>()
+                    .ok()
+            })
+            .map(|snapshot_config| {
+                spawn_template_startup_recording(
+                    crate::sandbox::record_startup_pack(
+                        *snapshot_config,
+                        build_execution.output_dir.clone(),
+                    ),
+                    Arc::clone(&workspace_lease),
+                )
+            });
         let record = snapshot_manager
             .publish(
                 SnapshotPublishMetadata {
@@ -144,6 +186,7 @@ impl TemplateBuilder {
                     custom_extension_params: None,
                 },
                 build_execution.manifest,
+                recording,
             )
             .await?;
 
@@ -153,6 +196,26 @@ impl TemplateBuilder {
 }
 
 impl TemplateBuilder {
+    async fn execute_in_background(
+        context: TemplateBuildContext,
+        execute: impl FnOnce(&TemplateBuildContext) -> anyhow::Result<TemplateBuildExecution>
+            + Send
+            + 'static,
+    ) -> TemplateBuildResult<(TemplateBuildContext, anyhow::Result<TemplateBuildExecution>)> {
+        let span = tracing::Span::current();
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatcher, || {
+                let _guard = span.enter();
+                let result = execute(&context);
+                // Publication still needs the artifacts owned by the context's workspace.
+                (context, result)
+            })
+        })
+        .await
+        .map_err(|error| TemplateBuildError::with_source("join template build worker", error))
+    }
+
     fn build_failure_reason(error: &AnyhowError) -> TemplateBuildErrorReason {
         error
             .chain()
@@ -203,6 +266,7 @@ impl TemplateBuilder {
         let workspace = self.create_local_dir(&snapshot_id)?;
 
         Ok(TemplateBuildContext {
+            logger: spec.logger.clone(),
             build_snapshot_id: snapshot_id,
             alias,
             initial_context: spec.base_context_ref().cloned().unwrap_or_default(),
@@ -258,13 +322,23 @@ impl TemplateBuilder {
         let initial_context = base_snapshot.committed().context.clone();
         let override_startup = spec.overrides_startup();
         let startup = if override_startup {
-            Self::startup_from_spec(spec)
+            Self::startup_from_spec(spec).map(|mut startup| {
+                if startup.shell.is_none() {
+                    startup.shell = base_snapshot
+                        .committed()
+                        .startup
+                        .as_ref()
+                        .and_then(|base| base.shell.clone());
+                }
+                startup
+            })
         } else {
             base_snapshot.committed().startup.clone()
         };
         let workspace = self.create_local_dir(&snapshot_id)?;
 
         Ok(TemplateBuildContext {
+            logger: spec.logger.clone(),
             build_snapshot_id: snapshot_id,
             alias,
             initial_context,
@@ -286,6 +360,7 @@ impl TemplateBuilder {
             start_cmd: spec.start_cmd_ref().unwrap_or_default().to_string(),
             ready_cmd: spec.ready_cmd_ref().unwrap_or_default().to_string(),
             context: CommandContext::default(),
+            shell: spec.startup_shell().map(str::to_owned),
         })
     }
 
@@ -335,7 +410,7 @@ impl TemplateBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotManager, SnapshotRecord};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -365,6 +440,72 @@ mod tests {
                 sub_path: None,
             }],
         )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn template_execution_keeps_runtime_responsive_and_artifacts_alive() {
+        let context = TemplateBuilder::new()
+            .prepare_snapshot_base_context(
+                &TemplateBuildSpec::new(),
+                SnapshotId::generate(),
+                &RunnableSnapshot::mock(),
+            )
+            .unwrap();
+        let workspace = context.local_dir().to_path_buf();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let execution = TemplateBuilder::execute_in_background(context, move |context| {
+            started.send(()).unwrap();
+            // Only the async task below can release this synchronous worker.
+            released.recv_timeout(std::time::Duration::from_secs(5))?;
+            std::fs::write(context.local_dir().join("artifact"), b"snapshot")?;
+            anyhow::bail!("test build failure")
+        });
+        let (result, ()) = tokio::join!(execution, async {
+            running.await.unwrap();
+            release.send(()).unwrap();
+        });
+        let (context, result) = result.unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "test build failure");
+        assert_eq!(
+            std::fs::read(workspace.join("artifact")).unwrap(),
+            b"snapshot"
+        );
+        drop(context);
+        assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_recording_retains_template_workspace_until_continuation_finishes() {
+        let workspace = Arc::new(TempDir::new().expect("tempdir"));
+        let workspace_path = workspace.path().to_path_buf();
+        let trace_path = workspace_path.join(crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT);
+        let task_trace_path = trace_path.clone();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let recording = spawn_template_startup_recording(
+            async move {
+                let _ = wait.await;
+                tokio::fs::write(&task_trace_path, b"trace")
+                    .await
+                    .expect("workspace must remain writable");
+                Some(task_trace_path)
+            },
+            Arc::clone(&workspace),
+        );
+
+        drop(workspace);
+        assert!(workspace_path.exists());
+        let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+        release.send(()).expect("recording task running");
+        assert_eq!(
+            trace.await.expect("recording task"),
+            Some(trace_path.clone())
+        );
+        assert_eq!(tokio::fs::read(trace_path).await.expect("trace"), b"trace");
+        assert!(workspace_path.exists());
+
+        drop(keep_alive);
+        assert!(!workspace_path.exists());
     }
 
     #[tokio::test]
@@ -594,6 +735,7 @@ mod tests {
     fn snapshot_base_context_inherits_base_startup_when_not_overridden() {
         let manager = TemplateBuilder::new();
         let startup = StartupCommand {
+            shell: Some("/bin/sh".into()),
             start_cmd: "echo base".to_string(),
             ready_cmd: "echo ready".to_string(),
             context: CommandContext::new(
@@ -624,6 +766,7 @@ mod tests {
         let manager = TemplateBuilder::new();
         let record = SnapshotRecord::mock_ready(CommittedSnapshot {
             startup: Some(StartupCommand {
+                shell: None,
                 start_cmd: "echo base".to_string(),
                 ready_cmd: "echo base-ready".to_string(),
                 context: CommandContext::new(std::collections::HashMap::new(), "/base"),
@@ -655,5 +798,51 @@ mod tests {
             Some("")
         );
         assert!(context.override_startup);
+    }
+
+    #[test]
+    fn startup_command_overrides_inherit_shell_unless_explicitly_set() {
+        for base_shell in [None, Some(None), Some(Some("/bin/sh"))] {
+            for explicit_shell in [None, Some("/bin/ash")] {
+                for start_override in [true, false] {
+                    let runnable = RunnableSnapshot::from_test_manifest(
+                        SnapshotRecord::mock_ready(CommittedSnapshot {
+                            startup: base_shell.map(|shell| StartupCommand {
+                                shell: shell.map(str::to_owned),
+                                start_cmd: "echo base".into(),
+                                ready_cmd: "true".into(),
+                                context: CommandContext::default(),
+                            }),
+                            ..CommittedSnapshot::mock()
+                        }),
+                        Vec::new(),
+                    );
+                    let mut spec = if start_override {
+                        TemplateBuildSpec::new().start_cmd("echo derived")
+                    } else {
+                        TemplateBuildSpec::new().ready_cmd("test -f /ready")
+                    };
+                    if let Some(shell) = explicit_shell {
+                        spec = spec.with_startup_shell(shell);
+                    }
+                    let context = TemplateBuilder::new()
+                        .prepare_snapshot_base_context(&spec, SnapshotId::generate(), &runnable)
+                        .unwrap();
+                    let startup = context.startup.unwrap();
+                    assert_eq!(
+                        startup.shell.as_deref(),
+                        explicit_shell.or(base_shell.flatten())
+                    );
+                    assert_eq!(
+                        startup.start_cmd,
+                        if start_override { "echo derived" } else { "" }
+                    );
+                    assert_eq!(
+                        startup.ready_cmd,
+                        if start_override { "" } else { "test -f /ready" }
+                    );
+                }
+            }
+        }
     }
 }

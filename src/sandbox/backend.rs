@@ -14,18 +14,22 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    EnvdAccessToken, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
-    SandboxLaunchConfig, SandboxNetworkPolicy,
+    record_startup_pack, EnvdAccessToken, EnvdApi, Executor, FirecrackerCaptureArtifacts,
+    FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput, SandboxLaunchConfig,
+    SandboxNetworkPolicy,
 };
+use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
-use crate::snapshot::RunnableSnapshot;
-use crate::types::SandboxId;
+use crate::snapshot::{
+    RunnableSnapshot, SandboxSnapshotManifest, SnapshotManager, SnapshotPublishMetadata,
+    SnapshotRecord, StartupRecording,
+};
+use crate::types::{RuntimeArtifactSet, SandboxId};
 
 /// A concrete sandbox backend's paused state.
 ///
 /// The Orchestrator treats this value as completely opaque: it stores it in
-/// [`SandboxMetadata`][crate::orchestrator::SandboxMetadata] after a
-/// `pause` call and passes it back to
+/// its `SandboxMetadata` after a `pause` call and passes it back to
 /// [`SandboxBackendFactory::build_from_paused_state`] when a resume is requested.
 /// Concrete implementations own their serialized form.
 pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
@@ -93,39 +97,6 @@ pub struct SandboxForkSpec {
     pub replace_drive_ids: Vec<(String, String)>,
 }
 
-/// Opaque set of local runtime artifacts a sandbox needs while it is alive.
-///
-/// Sandbox backends construct this from their runtime config, the orchestrator
-/// carries it across lifecycle boundaries, and the image-liveness layer decides
-/// how to protect the concrete local artifacts.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RuntimeArtifactSet {
-    overlaybd_image_config_paths: Vec<PathBuf>,
-}
-
-impl RuntimeArtifactSet {
-    /// No local runtime artifacts.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Build from overlaybd image configs whose local-only layers must stay
-    /// available while the sandbox may reopen them.
-    pub(crate) fn from_overlaybd_image_configs(overlaybd_image_config_paths: Vec<PathBuf>) -> Self {
-        Self {
-            overlaybd_image_config_paths,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.overlaybd_image_config_paths.is_empty()
-    }
-
-    pub(crate) fn into_overlaybd_image_config_paths(self) -> Vec<PathBuf> {
-        self.overlaybd_image_config_paths
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SandboxRuntimeInfo {
     pub rootfs_virtual_size: Option<u64>,
@@ -138,43 +109,79 @@ pub struct SandboxRuntimeInfo {
 /// consumption by snapshot publication code. Concrete backends may use it to
 /// keep temporary artifact directories alive until publication finishes.
 pub struct CapturedSandboxSnapshot {
-    inner: Box<dyn Any + Send>,
+    manifest: SandboxSnapshotManifest,
+    artifacts: Box<dyn Any + Send>,
 }
 
 impl CapturedSandboxSnapshot {
-    pub fn new<T>(snapshot: T) -> Self
+    /// Take a capture, with whatever the backend has to hold on to until
+    /// publication is over. A backend which writes its artifacts under a
+    /// temporary root passes the guard of that root as `artifacts`, and one
+    /// which writes them somewhere durable passes `()`.
+    pub fn new<T>(manifest: SandboxSnapshotManifest, artifacts: T) -> Self
     where
         T: Send + 'static,
     {
         Self {
-            inner: Box::new(snapshot),
+            manifest,
+            artifacts: Box::new(artifacts),
         }
     }
 
-    pub fn downcast_ref<T>(&self) -> Option<&T>
-    where
-        T: Send + 'static,
-    {
-        self.inner.downcast_ref::<T>()
+    /// What was captured, in the form the snapshot layer publishes.
+    pub fn manifest(&self) -> &SandboxSnapshotManifest {
+        &self.manifest
     }
 
-    pub fn downcast<T>(self) -> std::result::Result<T, Self>
+    /// The backend which took the capture.
+    pub fn backend(&self) -> &str {
+        &self.manifest.backend
+    }
+
+    pub fn downcast_artifacts_ref<T>(&self) -> Option<&T>
     where
         T: Send + 'static,
     {
-        match self.inner.downcast::<T>() {
-            Ok(inner) => Ok(*inner),
-            Err(inner) => Err(Self { inner }),
-        }
+        self.artifacts.downcast_ref::<T>()
     }
 }
 
 impl fmt::Debug for CapturedSandboxSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CapturedSandboxSnapshot")
-            .field("opaque", &true)
-            .finish()
+            .field("backend", &self.manifest.backend)
+            .finish_non_exhaustive()
     }
+}
+
+/// Publishes `captured_snapshot` through `snapshots`. Its artifacts stay
+/// alive until publication is over.
+#[tracing::instrument(skip(snapshots, metadata), fields(snapshot_id = %metadata.id))]
+pub async fn publish_captured(
+    snapshots: &SnapshotManager,
+    metadata: SnapshotPublishMetadata,
+    captured_snapshot: CapturedSandboxSnapshot,
+) -> RepositoryResult<SnapshotRecord> {
+    let manifest = captured_snapshot.manifest().clone();
+
+    // Spawn the startup-manifest recording up front (a no-op task when
+    // the feature is disabled): the throwaway recording VM overlaps the
+    // backend's layer uploads, and a detached continuation uploads the
+    // manifest once the trace lands — publish never waits on it. The
+    // capture root guard travels with the task so the artifacts outlive
+    // the whole continuation.
+    let recording = captured_snapshot
+        .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
+        .map(|artifacts| {
+            let snapshot_config = artifacts.snapshot_config().clone();
+            let snapshot_dir = artifacts.snapshot_dir().to_path_buf();
+            StartupRecording::spawn_with_capture_lease(
+                record_startup_pack(snapshot_config, snapshot_dir),
+                artifacts.snapshot_root_guard(),
+            )
+        });
+
+    snapshots.publish(metadata, manifest, recording).await
 }
 
 /// Lifecycle interface for a single sandbox instance.
@@ -183,6 +190,11 @@ impl fmt::Debug for CapturedSandboxSnapshot {
 /// `Arc<Mutex<Box<dyn SandboxBackend>>>` handles managed by the Orchestrator.
 #[async_trait]
 pub trait SandboxBackend: Send + 'static {
+    /// The guest's envd API, or None while no guest agent is connected. Take
+    /// it under the runtime lock and call it after releasing the lock, so
+    /// guest I/O never blocks lifecycle operations.
+    fn envd(&self) -> Option<Arc<dyn EnvdApi>>;
+
     /// Start the sandbox and block until readiness.
     async fn start(&mut self) -> Result<()>;
 
@@ -251,10 +263,36 @@ pub trait SandboxBackend: Send + 'static {
         spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>>;
 
+    /// Capture the guest into `at` and describe what was written.
+    ///
+    /// The guest is left held. A template build takes its snapshot this way
+    /// and stops the sandbox afterwards, so unlike [`snapshot`][Self::snapshot]
+    /// nothing is resumed and the directory is the caller's to keep. The
+    /// optional second tuple element carries the backend's opaque capture
+    /// payload for consumers that need backend-specific capture state (e.g.
+    /// startup-manifest recording re-booting from the capture); `None` for
+    /// backends without one.
+    async fn capture_to_dir(
+        &mut self,
+        at: &Path,
+    ) -> SandboxCaptureResult<(SandboxSnapshotManifest, Option<Box<dyn Any + Send>>)>;
+
     /// Stop the sandbox and release all associated system resources.
     ///
     /// Idempotent: calling `stop` more than once must not return an error.
     async fn stop(&mut self) -> Result<()>;
+
+    /// Freeze writable persistent filesystems and seal their volume layers,
+    /// without capturing memory, rootfs, or VM state. On success, writes remain
+    /// frozen until `stop` or `thaw_volumes`. Recoverable errors guarantee that
+    /// writes have resumed; terminal errors require runtime teardown.
+    /// Callers must keep ownership through completion and thaw/stop; dropping
+    /// this future does not cancel guest I/O. The orchestrator shields deletion
+    /// from request cancellation with an owned task.
+    async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()>;
+
+    /// Resume writes after abandoning a deletion that froze the volumes.
+    async fn thaw_volumes(&mut self) -> Result<()>;
 
     /// Obtain the IP address that the sandbox can use to interact with the host.
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr>;
@@ -278,9 +316,8 @@ pub trait SandboxBackend: Send + 'static {
 
 /// Factory interface for creating and restoring sandbox backend instances.
 ///
-/// A single factory instance is stored inside the
-/// [`Orchestrator`][crate::orchestrator::Orchestrator] and is used for every
-/// `create_sandbox` and `resume_sandbox` request.
+/// A single factory instance is stored inside the `Orchestrator` and is
+/// used for every `create_sandbox` and `resume_sandbox` request.
 pub trait SandboxBackendFactory: Send + Sync + 'static {
     /// Build a brand-new sandbox backend from a high-level launch request.
     fn build(

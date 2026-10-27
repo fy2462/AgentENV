@@ -167,7 +167,8 @@ never a live server's state. Set `AENV_CONFIG_PATH` for non-default test configs
 | API and lifecycle | `src/api/impls/`, `src/orchestrator/service.rs`, `src/sandbox/backend.rs` |
 | Firecracker and drives | `src/sandbox/firecracker/`, `src/sandbox/ublk/`, `src/sandbox/extra_drive.rs` |
 | Snapshots and templates | `src/snapshot/`, `src/template/` |
-| Volumes | `src/volume.rs`, `src/api/impls/volumes.rs`, `src/api/impls/sandbox.rs` |
+| Durable repository (OSS/POSIX) | `src/repository/` |
+| Volumes | `src/volume/`, `src/api/impls/volumes.rs`, `src/api/impls/sandbox.rs` |
 | Layered storage | `storage/overlaybd/`, `storage/ublk/`, `storage/ublk-daemon/`, `storage/util/` |
 | Images and P2P | `src/image/`, `src/p2p/`, `src/overlaybd/p2p/` |
 | Control plane and metrics | `services/`, `src/observability/` |
@@ -181,6 +182,9 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
 
 ## Constraints to Preserve
 
+- **Layering:** Top-level `src/` modules must not depend on each other in a
+  cycle (`src/module_cycles.rs` tests this). Move shared data down rather than
+  importing upward.
 - **Lifecycle:** Recoverable capture/fork errors restore `Running`; terminal
   errors require teardown. Graceful shutdown persists sandboxes as `Paused`.
   Keep `CapturedSandboxSnapshot` alive until repository publication completes.
@@ -194,7 +198,8 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
   Reject deletion while mounted and new mounts while `uploading`/`failed`.
   Fork exclusive volumes per child, share read-only volumes, and roll back failed
   child allocations. Snapshots store `volume_snapshots` separately from attached
-  drives; launches recreate volumes unless explicit `volumeMounts` replaces them.
+  drives; launches recreate volumes and reject explicit `volumeMounts` (including
+  empty arrays) for snapshots that have volumes.
   Deleting a source volume must not invalidate committed snapshots.
 - **Registries:** Use configured `regctl` and `ImageResolver`. Preserve lazy reads
   for OverlayBD-native images. Private registries use the runtime user's Docker

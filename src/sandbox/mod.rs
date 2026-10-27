@@ -4,10 +4,15 @@ pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
 mod firecracker;
+mod guest_volumes;
+pub(crate) mod logs;
+mod metrics;
 #[cfg(test)]
 pub(crate) mod mock;
 mod network;
 mod process;
+mod runtime_versions;
+mod tools_image;
 mod ublk;
 
 use std::{collections::HashMap, path::PathBuf};
@@ -16,31 +21,38 @@ pub(crate) use custom_extension::{
     custom_extension_params_is_empty, CustomExtensionClient, CustomExtensionParams,
 };
 
+pub use crate::types::RuntimeArtifactSet;
 use crate::types::{ImageConfigs, SandboxId};
 
+pub use crate::snapshot::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+pub use crate::types::{
+    normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
+    validate_sub_path, ExtraDrive, ExtraDriveKind,
+};
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
+    publish_captured, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
-pub use extra_drive::{
-    normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
-    validate_sub_path, ExtraDrive,
-};
+pub use envd::EnvdApi;
+pub(crate) use firecracker::record_startup_pack;
 pub use firecracker::{
-    FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
+    FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
+    FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
+pub use logs::SandboxLogEntry;
+pub use metrics::SandboxMetric;
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{
     BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
     ALL_INTERNET_TRAFFIC_CIDR,
 };
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
-pub(crate) use ublk::{compact_layers, OverlaybdCompactOutput};
+pub use runtime_versions::probe_runtime_versions;
+pub(crate) use tools_image::resolve_tools_image;
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]

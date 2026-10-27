@@ -108,10 +108,17 @@ pub struct TemplateBuildSpec {
     resources: Option<SandboxResources>,
     start_cmd: Option<String>,
     ready_cmd: Option<String>,
+    startup_shell: Option<String>,
     base_context: Option<CommandContext>,
+    pub(crate) logger: super::logs::BuildLogger,
 }
 
 impl TemplateBuildSpec {
+    pub(crate) fn with_logger(mut self, logger: super::logs::BuildLogger) -> Self {
+        self.logger = logger;
+        self
+    }
+
     /// Creates an empty template build description.
     pub fn new() -> Self {
         Self::default()
@@ -274,6 +281,15 @@ impl TemplateBuildSpec {
 
     pub(crate) fn ready_cmd_ref(&self) -> Option<&str> {
         self.ready_cmd.as_deref()
+    }
+
+    pub(crate) fn with_startup_shell(mut self, shell: &str) -> Self {
+        self.startup_shell = Some(shell.to_owned());
+        self
+    }
+
+    pub(crate) fn startup_shell(&self) -> Option<&str> {
+        self.startup_shell.as_deref()
     }
 
     pub(crate) fn with_base_context(mut self, context: CommandContext) -> Self {

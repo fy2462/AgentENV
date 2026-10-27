@@ -1,15 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, LazyLock,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
+use async_trait::async_trait;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, trace};
 
-use crate::sandbox::EnvdAccessToken;
-use envd::filesystem::FilesystemClient;
+use crate::logging::LogLevel;
+use crate::sandbox::logs::{LogDecoder, LogPage, MAX_LOG_BYTES};
+use crate::sandbox::{EnvdAccessToken, SandboxLogEntry, SandboxMetric};
+use envd::filesystem::{FileType, FilesystemClient, ListDirRequest, StatRequest};
 use envd::http_client::apis::{
     configuration::{ApiKey, Configuration},
     default_api,
@@ -17,6 +20,9 @@ use envd::http_client::apis::{
 use envd::http_client::models::InitPostRequest;
 use envd::process::ProcessClient;
 use envd::reqwest::Client;
+use futures::{FutureExt, StreamExt};
+
+mod user;
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -156,6 +162,30 @@ impl EnvdInstance {
         default_workdir: Option<String>,
         default_user: Option<String>,
     ) -> Result<()> {
+        let default_user = match default_user {
+            Some(user) if user::needs_resolution(&user) => {
+                // Authenticate this runtime first, including after restore.
+                // Account setup runs before the sandbox becomes available.
+                self.post_init(None, Some("/".to_owned()), Some("root".to_owned()))
+                    .await?;
+                Some(
+                    tokio::time::timeout(Duration::from_secs(30), self.resolve_default_user(&user))
+                        .await
+                        .context("timed out resolving Dockerfile USER")??,
+                )
+            }
+            user => user,
+        };
+        self.post_init(env_vars, default_workdir, default_user)
+            .await
+    }
+
+    async fn post_init(
+        &self,
+        env_vars: Option<HashMap<String, String>>,
+        default_workdir: Option<String>,
+        default_user: Option<String>,
+    ) -> Result<()> {
         debug!(has_env_vars = env_vars.is_some(), "initializing envd");
         let now = chrono::Utc::now().fixed_offset();
         let init_post_request = InitPostRequest {
@@ -175,13 +205,161 @@ impl EnvdInstance {
     }
 }
 
+/// Calls the orchestrator makes into a running guest through envd.
+///
+/// `SandboxBackend::envd` hands this out under the runtime lock, and callers
+/// make the call after releasing it. A new guest call only needs a method here
+/// and its `EnvdInstance` implementation.
+#[async_trait]
+pub trait EnvdApi: Send + Sync {
+    async fn metrics(&self) -> Result<SandboxMetric>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn logs(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+        backward: bool,
+        level: Option<LogLevel>,
+        search: Option<String>,
+    ) -> Result<Vec<SandboxLogEntry>>;
+}
+
+#[async_trait]
+impl EnvdApi for EnvdInstance {
+    async fn metrics(&self) -> Result<SandboxMetric> {
+        self.ensure_live()?;
+        let raw = default_api::metrics_get(&self.config).await?;
+        raw.try_into()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn logs(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+        backward: bool,
+        level: Option<LogLevel>,
+        search: Option<String>,
+    ) -> Result<Vec<SandboxLogEntry>> {
+        self.ensure_live()?;
+        let mut client = self.filesystem_client().boxed().await?;
+        let mut request = tonic::Request::new(ListDirRequest {
+            path: LOG_DIRECTORY.into(),
+            depth: 1,
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            tonic::metadata::MetadataValue::from_static("Basic cm9vdDo="),
+        );
+        let entries = match client.list_dir(request).boxed().await {
+            Ok(response) => response.into_inner().entries,
+            Err(e) if e.code() == tonic::Code::NotFound => Vec::new(),
+            Err(e) => return Err(e).context("list guest log files"),
+        };
+        let mut names: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.r#type == FileType::File as i32 && is_log_filename(&e.name))
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        ensure!(names.len() <= 32, "too many guest log files");
+
+        let mut stat_request = tonic::Request::new(StatRequest {
+            path: ENVD_STDERR_PATH.into(),
+        });
+        stat_request.metadata_mut().insert(
+            "authorization",
+            tonic::metadata::MetadataValue::from_static("Basic cm9vdDo="),
+        );
+        let stderr_timestamp = match client.stat(stat_request).boxed().await {
+            Ok(response) => response
+                .into_inner()
+                .entry
+                .and_then(|entry| entry.modified_time)
+                .and_then(|timestamp| {
+                    u32::try_from(timestamp.nanos).ok().and_then(|nanos| {
+                        chrono::DateTime::from_timestamp(timestamp.seconds, nanos)
+                    })
+                }),
+            Err(error) if error.code() == tonic::Code::NotFound => None,
+            Err(error) => return Err(error).context("stat guest envd stderr log"),
+        };
+
+        let mut sources: Vec<_> = names
+            .into_iter()
+            .map(|name| (format!("{LOG_DIRECTORY}/{name}"), None))
+            .collect();
+        if let Some(timestamp) = stderr_timestamp {
+            sources.push((ENVD_STDERR_PATH.into(), Some(timestamp)));
+        }
+
+        let mut page = LogPage::new(start, end, limit, backward, level, search);
+        let mut total = 0;
+        for (path, fallback_timestamp) in sources {
+            self.ensure_live()?;
+            let mut request = self
+                .config
+                .client
+                .get(format!("{}/files", self.config.base_path))
+                .query(&[("path", path), ("username", "root".into())]);
+            if let Some(token) = self.access_token.as_ref() {
+                request = request.header("X-Access-Token", token.expose());
+            }
+            let response = request.send().await?;
+            if response.status() == 404 {
+                continue;
+            }
+            let response = response.error_for_status()?;
+            let mut stream = response.bytes_stream();
+            let mut decoder = fallback_timestamp.map_or_else(LogDecoder::default, |timestamp| {
+                LogDecoder::with_fallback(
+                    timestamp,
+                    LogLevel::Error,
+                    BTreeMap::from([
+                        ("logger".into(), "envd".into()),
+                        ("source".into(), "stderr".into()),
+                    ]),
+                )
+            });
+            while let Some(chunk) = stream.next().await {
+                self.ensure_live()?;
+                let chunk = chunk?;
+                total += chunk.len();
+                ensure!(total <= MAX_LOG_BYTES, "guest logs exceed query size limit");
+                for bytes in chunk.chunks(8192) {
+                    for entry in decoder.feed(bytes)? {
+                        page.push(entry);
+                    }
+                }
+            }
+        }
+        self.ensure_live()?;
+        Ok(page.finish())
+    }
+}
+
+const LOG_DIRECTORY: &str = "/var/log/agentenv/envd";
+const ENVD_STDERR_PATH: &str = "/var/log/agentenv/envd.stderr.log";
+
+fn is_log_filename(name: &str) -> bool {
+    name == "current"
+        || (name.len() == 27
+            && name.starts_with('@')
+            && name.ends_with(".s")
+            && name.as_bytes()[1..25].iter().all(u8::is_ascii_hexdigit))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
 
-    use axum::extract::State;
+    use axum::extract::{Query, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::Value;
     use tokio::net::TcpListener;
@@ -196,6 +374,36 @@ mod tests {
     ) -> StatusCode {
         sender.send((headers, body)).await.unwrap();
         StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn sandbox_metrics_uses_guest_auth_and_rejects_invalidated_runtime() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("metrics-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let expected_token = token.clone();
+        let app = Router::new().route(
+            "/metrics",
+            get(move |headers: HeaderMap| async move {
+                assert_eq!(headers["x-access-token"], expected_token.expose());
+                Json(serde_json::json!({
+                    "ts": 1700000000, "cpu_count": 2, "cpu_used_pct": 25.0,
+                    "mem_used": 4000000000i64, "mem_total": 8000000000i64,
+                    "mem_cache": 3000000000i64, "disk_used": 9000000000i64,
+                    "disk_total": 20000000000i64
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let envd = EnvdInstance::new(format!("http://{address}"), Some(token));
+        let sample = envd.metrics().await?;
+        assert_eq!(sample.mem_total, 8000000000);
+        assert_eq!(sample.disk_total, 20000000000);
+        envd.invalidate();
+        assert!(envd.metrics().await.is_err());
+        server.abort();
+        Ok(())
     }
 
     #[tokio::test]
@@ -216,6 +424,42 @@ mod tests {
         let (headers, body) = receiver.recv().await.expect("captured init request");
         assert_eq!(headers["x-access-token"], token.expose());
         assert_eq!(body["accessToken"], token.expose());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_resolves_numeric_default_user_and_preserves_image_environment() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (sender, mut receiver) = mpsc::channel(2);
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("numeric-user-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let file_token = token.clone();
+        let app = Router::new()
+            .route("/init", post(capture_init_request))
+            .route("/files", get(move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                assert_eq!(headers["x-access-token"], file_token.expose());
+                assert_eq!(query["path"], "/etc/passwd");
+                assert_eq!(query["username"], "root");
+                b"root:x:0:0:r\xffot:/root:/bin/sh\nother:x:1000:1000:\xff:/home/other:/bin/sh\n".to_vec()
+            }))
+            .with_state(sender);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let envd = EnvdInstance::new(format!("http://{address}"), Some(token.clone()));
+        envd.init(
+            Some(HashMap::from([("HOME".to_owned(), "/app".to_owned())])),
+            Some("/work".to_owned()),
+            Some("0".to_owned()),
+        )
+        .await?;
+        let (headers, bootstrap) = receiver.recv().await.unwrap();
+        assert_eq!(headers["x-access-token"], token.expose());
+        assert_eq!(bootstrap["accessToken"], token.expose());
+        let (_, body) = receiver.recv().await.unwrap();
+        assert_eq!(body["defaultUser"], "root");
+        assert_eq!(body["defaultWorkdir"], "/work");
+        assert_eq!(body["envVars"]["HOME"], "/app");
         server.abort();
         Ok(())
     }
@@ -253,5 +497,156 @@ mod tests {
 
         assert!(stale.process_client().await.is_err());
         assert!(stale.filesystem_client().await.is_err());
+    }
+    #[tokio::test]
+    async fn sandbox_logs_guest_fetch_auth_filter_and_failure() -> Result<()> {
+        use crate::sandbox::SandboxAccessTokenGenerator;
+        use axum::{
+            body::Body,
+            extract::Query,
+            http::{HeaderMap, StatusCode},
+            response::Response,
+            routing::{get, post},
+            Router,
+        };
+        use envd::filesystem::{EntryInfo, ListDirResponse, StatResponse};
+        use prost::Message;
+        use std::{
+            collections::HashMap,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let token = SandboxAccessTokenGenerator::new("logs-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let fail = Arc::new(AtomicBool::new(false));
+        let app = Router::new().route("/filesystem.Filesystem/ListDir", post({
+            let token = token.clone();
+            move |headers: HeaderMap| {
+                let token = token.clone();
+                async move {
+                    assert_eq!(headers["x-access-token"], token.expose());
+                    assert_eq!(headers["authorization"], "Basic cm9vdDo=");
+                    let bytes = ListDirResponse { entries: vec![EntryInfo { name: "current".into(), r#type: FileType::File as i32, ..Default::default() }] }.encode_to_vec();
+                    let mut frame = vec![0];
+                    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                    frame.extend_from_slice(&bytes);
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", "0".parse().unwrap());
+                    let frames = futures::stream::iter([
+                        Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(bytes::Bytes::from(frame))),
+                        Ok(hyper::body::Frame::trailers(trailers)),
+                    ]);
+                    Response::builder().header("content-type", "application/grpc")
+                        .body(Body::new(http_body_util::StreamBody::new(frames))).unwrap()
+                }
+            }
+        }))
+        .route("/filesystem.Filesystem/Stat", post({
+            let token = token.clone();
+            move |headers: HeaderMap| {
+                let token = token.clone();
+                async move {
+                    assert_eq!(headers["x-access-token"], token.expose());
+                    assert_eq!(headers["authorization"], "Basic cm9vdDo=");
+                    let now = chrono::Utc::now();
+                    let bytes = StatResponse {
+                        entry: Some(EntryInfo {
+                            name: "envd.stderr.log".into(),
+                            path: ENVD_STDERR_PATH.into(),
+                            r#type: FileType::File as i32,
+                            modified_time: Some(prost_types::Timestamp {
+                                seconds: now.timestamp(),
+                                nanos: now.timestamp_subsec_nanos() as i32,
+                            }),
+                            ..Default::default()
+                        }),
+                    }
+                    .encode_to_vec();
+                    let mut frame = vec![0];
+                    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                    frame.extend_from_slice(&bytes);
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", "0".parse().unwrap());
+                    let frames = futures::stream::iter([
+                        Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(bytes::Bytes::from(frame))),
+                        Ok(hyper::body::Frame::trailers(trailers)),
+                    ]);
+                    Response::builder()
+                        .header("content-type", "application/grpc")
+                        .body(Body::new(http_body_util::StreamBody::new(frames)))
+                        .unwrap()
+                }
+            }
+        }))
+        .route("/files", get({
+            let token = token.clone();
+            let fail = fail.clone();
+            move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| {
+                let token = token.clone(); let fail = fail.clone();
+                async move {
+                    assert_eq!(headers["x-access-token"], token.expose());
+                    assert_eq!(query["username"], "root");
+                    if fail.load(Ordering::SeqCst) {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+                    }
+                    if query["path"] == ENVD_STDERR_PATH {
+                        return (StatusCode::OK, "fatal envd failure\n".to_owned());
+                    }
+                    assert_eq!(query["path"], "/var/log/agentenv/envd/current");
+                    let now = chrono::Utc::now().to_rfc3339();
+                    (StatusCode::OK, format!("{{\"timestamp\":\"{now}\",\"level\":\"info\",\"message\":\"first\",\"logger\":\"envd\"}}\n{{\"timestamp\":\"{now}\",\"level\":\"error\",\"message\":\"second\"}}\n"))
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let mut envd = EnvdInstance::new(format!("http://{address}"), Some(token));
+        envd.config.client = envd::reqwest::Client::builder().no_proxy().build()?;
+        let (start, _) = crate::sandbox::logs::log_query_window(None, true);
+        let end = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+        let page = envd
+            .logs(start, end, 10, true, Some(LogLevel::Error), None)
+            .boxed()
+            .await?;
+        assert_eq!(page.len(), 2);
+        assert!(page.iter().any(|entry| entry.message == "second"));
+        let stderr = page
+            .iter()
+            .find(|entry| entry.message == "fatal envd failure")
+            .expect("envd stderr log entry");
+        assert_eq!(stderr.level, LogLevel::Error);
+        assert_eq!(stderr.fields["source"], "stderr");
+        fail.store(true, Ordering::SeqCst);
+        assert!(envd
+            .logs(start, end, 1, true, Some(LogLevel::Error), None,)
+            .boxed()
+            .await
+            .is_err());
+        envd.invalidate();
+        assert!(envd
+            .logs(start, end, 1, true, Some(LogLevel::Error), None)
+            .boxed()
+            .await
+            .is_err());
+        server.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn guest_log_names_cannot_escape_directory() {
+        assert!(is_log_filename("current"));
+        assert!(is_log_filename("@4000000069a0000000000000.s"));
+        for name in [
+            "../current",
+            "/etc/shadow",
+            "config",
+            "@4000000069a0000000000000.u",
+            "@../../../../etc/shadow.s",
+        ] {
+            assert!(!is_log_filename(name));
+        }
     }
 }

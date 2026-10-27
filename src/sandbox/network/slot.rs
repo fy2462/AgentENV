@@ -237,6 +237,15 @@ impl Slot {
         )
         .context("Failed to bind mount new namespace")?;
 
+        // New namespaces inherit the host's IPv4 settings, commonly loose
+        // reverse-path filtering, which accepts guest packets with any routable
+        // source. Use strict mode for every interface created below; the kernel
+        // applies max(all, dev), so both values must be strict.
+        for conf in ["all", "default"] {
+            fs::write(format!("/proc/sys/net/ipv4/conf/{conf}/rp_filter"), "1")
+                .with_context(|| format!("Failed to enable strict rp_filter for {conf}"))?;
+        }
+
         // Configure interfaces inside the namespace via netlink
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -523,6 +532,7 @@ impl Slot {
     /// - Enabling IP forwarding so the namespace can route between tap0 and vpeer.
     /// - FORWARD rules to permit traffic between the VM (tap0) and the host veth (vpeer).
     /// - SNAT/DNAT for host<->VM communication via host_interaction_ip.
+    /// - Dropping guest packets whose source is not the VM's assigned address.
     #[tracing::instrument(fields(vm_ip = %vm_ip, host_interaction_ip = %host_interaction_ip))]
     fn configure_namespace_iptables_rules(
         host_interaction_ip: Ipv4Addr,
@@ -565,6 +575,13 @@ impl Slot {
                 table: "nat",
                 chain: "PREROUTING",
                 rule: format!("-i vpeer -d {} -j DNAT --to {}", host_interaction_ip, vm_ip),
+            },
+            // Anti-spoofing: the guest may only send from its assigned address.
+            // Other sources would bypass the SNAT above and leave the node as-is.
+            IptablesRestoreCommand::Append {
+                table: "raw",
+                chain: "PREROUTING",
+                rule: format!("-i tap0 ! -s {vm_ip} -j DROP"),
             },
         ];
 
@@ -1008,8 +1025,12 @@ mod tests {
     }
 
     fn unused_test_slot() -> Slot {
+        // Claim each index once so concurrent tests cannot pick the same free
+        // slot before either of them creates it.
+        static NEXT_IDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(30_000);
         let address_plan = NetworkAddressPlan::default();
-        (30_000..MAX_SLOTS as u32)
+        std::iter::repeat_with(|| NEXT_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            .take_while(|idx| *idx < MAX_SLOTS as u32)
             .find(|idx| !host_veth_exists(*idx))
             .and_then(|idx| test_slot(idx, address_plan).ok())
             .expect("failed to find an unused high-numbered network test slot")
@@ -1233,5 +1254,147 @@ mod tests {
                 Slot::host_veth_name(slot_idx)
             );
         });
+    }
+
+    /// Attaches to the slot's persistent `tap0`, as Firecracker would, so the
+    /// test can inject frames that the namespace sees as guest traffic.
+    fn open_tap0() -> File {
+        let tap = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .expect("open /dev/net/tun");
+        // SAFETY: ifreq is plain old data; the name and flags are set before use.
+        let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (dst, src) in req.ifr_name.iter_mut().zip(b"tap0") {
+            *dst = *src as libc::c_char;
+        }
+        req.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short;
+        // SAFETY: TUNSETIFF reads a valid ifreq for the duration of the call.
+        let rc = unsafe { libc::ioctl(tap.as_raw_fd(), libc::TUNSETIFF, &mut req) };
+        assert_eq!(rc, 0, "TUNSETIFF tap0: {}", std::io::Error::last_os_error());
+        tap
+    }
+
+    fn tap0_mac() -> Vec<u8> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (connection, handle, _) = new_connection().unwrap();
+            tokio::spawn(connection);
+            let link = handle
+                .link()
+                .get()
+                .match_name("tap0".to_string())
+                .execute()
+                .try_next()
+                .await
+                .unwrap()
+                .expect("tap0 should exist in the slot namespace");
+            link.attributes
+                .into_iter()
+                .find_map(|attr| match attr {
+                    LinkAttribute::Address(mac) => Some(mac),
+                    _ => None,
+                })
+                .expect("tap0 should have a MAC address")
+        })
+    }
+
+    /// Builds an Ethernet/IPv4/UDP frame (UDP checksum 0 is valid for IPv4).
+    fn udp_frame(dst_mac: &[u8], src: Ipv4Addr, dst: Ipv4Addr, port: u16) -> Vec<u8> {
+        let payload = b"spoof-test";
+        let udp_len = (8 + payload.len()) as u16;
+        let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, 17, 0, 0];
+        ip[2..4].copy_from_slice(&(20 + udp_len).to_be_bytes());
+        ip.extend_from_slice(&src.octets());
+        ip.extend_from_slice(&dst.octets());
+        let sum = ip
+            .chunks(2)
+            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+            .sum::<u32>();
+        let sum = (sum & 0xffff) + (sum >> 16);
+        let checksum = !((sum & 0xffff) + (sum >> 16)) as u16;
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = dst_mac.to_vec();
+        frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x01, 0x08, 0x00]);
+        frame.extend_from_slice(&ip);
+        frame.extend_from_slice(&40000u16.to_be_bytes());
+        frame.extend_from_slice(&port.to_be_bytes());
+        frame.extend_from_slice(&udp_len.to_be_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN/CAP_SYS_ADMIN and affects system configuration"]
+    fn guest_packets_with_foreign_source_are_dropped() {
+        use std::io::Write as _;
+
+        crate::logging::init_for_tests();
+        let mut slot = unused_test_slot();
+        if let Err(e) = slot.create_network() {
+            let err_str = e.to_string();
+            if err_str.contains("Operation not permitted") || err_str.contains("EPERM") {
+                println!("Skipping test due to lack of permissions");
+                return;
+            }
+            panic!("Failed to create network: {:?}", e);
+        }
+
+        let netns_path = slot.namespace_path();
+        let vm_ip = slot.address_plan.vm_ip();
+        let local_ip = slot.veth_vm_ip;
+        // Another slot's routable identity and an arbitrary public address.
+        let foreign_sources = [Ipv4Addr::new(10, 11, 0, 9), Ipv4Addr::new(203, 0, 113, 7)];
+        let result = thread::spawn(move || {
+            let netns = File::open(&netns_path).unwrap();
+            nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET).unwrap();
+            let mut tap = open_tap0();
+            let mac = tap0_mac();
+            let socket = std::net::UdpSocket::bind((local_ip, 0)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let mut delivered = |src: Ipv4Addr| {
+                tap.write_all(&udp_frame(&mac, src, local_ip, port))
+                    .unwrap();
+                socket.recv(&mut [0; 64]).is_ok()
+            };
+
+            let assigned = delivered(vm_ip);
+            let foreign = foreign_sources.map(&mut delivered);
+            // Strict rp_filter must still reject spoofed sources on its own.
+            apply_iptables_commands(
+                &[IptablesRestoreCommand::Delete {
+                    table: "raw",
+                    chain: "PREROUTING",
+                    rule: format!("-i tap0 ! -s {vm_ip} -j DROP"),
+                }],
+                OpenFailurePolicy::ReturnErr,
+            )
+            .unwrap();
+            let foreign_without_raw_rule = foreign_sources.map(&mut delivered);
+            (assigned, foreign, foreign_without_raw_rule)
+        })
+        .join();
+        assert!(slot.cleanup(false).is_ok(), "cleanup should succeed");
+
+        let (assigned, foreign, foreign_without_raw_rule) = result.expect("probe thread panicked");
+        assert!(
+            assigned,
+            "packet from the assigned VM IP should be delivered"
+        );
+        assert_eq!(foreign, [false, false], "spoofed sources should be dropped");
+        assert_eq!(
+            foreign_without_raw_rule,
+            [false, false],
+            "strict rp_filter should drop spoofed sources without the raw rule"
+        );
     }
 }
